@@ -108,9 +108,11 @@ class RefNAT:
         expired = self._expired(now)
         for k in expired:
             port = self.maps[k][0]
+            expires_at = self.maps[k][4]
             del self.maps[k]
             del self.port_owner[port]
-            self.quarantined[port] = now
+            # 过期端口自 expires_at（逻辑死亡时刻）起隔离，与核心一致。
+            self.quarantined[port] = expires_at
         for p in [p for p, t in self.quarantined.items()
                   if now >= t + self.quarantine]:
             del self.quarantined[p]

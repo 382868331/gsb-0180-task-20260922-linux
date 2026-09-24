@@ -8,6 +8,10 @@
      a. 端口池耗尽 -> 批量分配抛 PortExhaustionError 并整体回滚；
      b. 入站对端不匹配 -> 丢弃（PEER_MISMATCH）；
      c. 映射重建后旧 generation 的迟到包 -> 丢弃（STALE_GENERATION）。
+  3. 时钟推进与过期。
+  4. 复制与接管：主实例生成有序记录 -> 备用按序重放（重复幂等、
+     缺口报错）-> 追平后以更高栅栏接管 -> 拒绝旧主写入 ->
+     接管后继续分配（seq / generation 连续）。
 """
 
 from __future__ import annotations
@@ -15,10 +19,13 @@ from __future__ import annotations
 from adnat import (
     AddressDependentNAT,
     AllocationRequest,
+    ApplyOutcome,
     Endpoint,
+    JournalGapError,
     NATConfig,
     Packet,
     PortExhaustionError,
+    StaleFenceError,
 )
 
 PUB = "203.0.113.7"
@@ -105,7 +112,66 @@ def main() -> None:
           f"剩余活跃映射: {nat.stats()['live_mappings']}")
     assert nat.stats()["live_mappings"] == 0
 
-    print("\n演示完成：正常路径与三类拒绝/异常边界均按预期发生。")
+    print("\n[4] 复制与接管：有序记录 -> 备用重放 -> 栅栏接管")
+    cfg = NATConfig(public_ip=PUB, external_ports=(6200, 6201, 6202),
+                    lifetime=20, quarantine=5)
+    primary = AddressDependentNAT(cfg)
+    replica = AddressDependentNAT.standby(cfg)
+    primary.allocate(HOST, WEB_A)                       # CREATE seq1
+    primary.allocate(HOST, WEB_B)                       # CREATE seq2
+    primary.advance(5)
+    primary.translate_outbound(Packet(src=HOST, dst=WEB_A))   # REFRESH seq3
+    primary.release((HOST.ip, HOST.port, WEB_B.ip, WEB_B.port))  # RELEASE seq4
+    print("  主实例生成的有序记录:")
+    for rec in primary.journal():
+        print(f"    seq={rec.seq} fence={rec.fence} {rec.kind.value:<7}"
+              f" port={rec.external_port} gen={rec.generation}"
+              f" at={rec.at} expires_at={rec.expires_at}")
+
+    print("  备用按序重放:")
+    for rec in primary.journal():
+        outcome = replica.apply_record(rec)
+        print(f"    apply seq={rec.seq} -> {outcome.value}")
+    assert replica.snapshot_mappings() == primary.snapshot_mappings()
+    assert replica.quarantined_ports() == primary.quarantined_ports()
+    print(f"    重放后与主状态一致 (last_seq={replica.last_seq}, "
+          f"活跃映射={replica.stats()['live_mappings']})")
+
+    dup = replica.apply_record(primary.journal()[0])
+    print(f"    重复应用 seq=1 -> {dup.value}（幂等，状态不变）")
+    assert dup is ApplyOutcome.DUPLICATE
+
+    gappy = AddressDependentNAT.standby(cfg)
+    gappy.apply_record(primary.journal()[0])
+    try:
+        gappy.apply_record(primary.journal()[2])   # 跳过 seq=2
+        raise AssertionError("应当抛出 JournalGapError")
+    except JournalGapError as exc:
+        print(f"    缺口拒绝: {exc}")
+    assert gappy.last_seq == 1
+
+    replica.promote(through_seq=replica.last_seq, new_fence=2)
+    print(f"  备用追平 seq=4 后以更高栅栏接管: role={replica.role} "
+          f"fence={replica.fence}")
+
+    old = primary.allocate(Endpoint("10.0.0.9", 5001), WEB_A)  # 旧主仍 fence=1
+    old_rec = primary.journal()[-1]
+    print(f"  旧主继续写入: seq={old_rec.seq} fence={old_rec.fence} "
+          f"port={old.mapping.external_port}")
+    try:
+        replica.apply_record(old_rec)
+        raise AssertionError("应当抛出 StaleFenceError")
+    except StaleFenceError as exc:
+        print(f"    新主拒绝旧主写入: {exc}")
+
+    taken = replica.allocate(Endpoint("10.0.0.9", 5002), WEB_A)
+    new_rec = replica.journal()[-1]
+    print(f"  接管后继续分配: seq={new_rec.seq} fence={new_rec.fence} "
+          f"port={taken.mapping.external_port} gen={taken.mapping.generation}"
+          f"（seq/generation 连续，栅栏已升高）")
+    assert new_rec.seq == old_rec.seq and new_rec.fence == 2
+
+    print("\n演示完成：正常路径、三类拒绝/异常边界与复制接管均按预期发生。")
 
 
 if __name__ == "__main__":

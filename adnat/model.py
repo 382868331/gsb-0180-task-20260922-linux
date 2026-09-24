@@ -217,3 +217,95 @@ def udp_five_tuple(src: Endpoint, dst: Endpoint) -> FiveTuple:
         src_ip=src.ip, src_port=src.port,
         dst_ip=dst.ip, dst_port=dst.port,
     )
+
+
+# --------------------------------------------------------------------- #
+# 复制与接管：有序记录                                                    #
+# --------------------------------------------------------------------- #
+
+
+class JournalKind(enum.Enum):
+    """有序记录的事件类型（映射生命周期）。"""
+
+    CREATE = "create"
+    """allocate 新建映射（复用已有映射不产生记录）。"""
+
+    REFRESH = "refresh"
+    """成功的包改写刷新 last_seen / expires_at。"""
+
+    RELEASE = "release"
+    """显式 release 移除映射（过期不进日志，见 README 设计取舍）。"""
+
+
+class ApplyOutcome(enum.Enum):
+    """apply_record 的应用结果。"""
+
+    APPLIED = "applied"
+    """新记录：已按序应用并追加到本地日志。"""
+
+    DUPLICATE = "duplicate"
+    """重复记录（序号已应用且内容完全一致）：幂等无操作，状态不变。"""
+
+
+@dataclass(frozen=True, slots=True)
+class JournalRecord:
+    """一条有序映射生命周期记录（主实例生成，备用实例按序重放）。
+
+    seq:           全局连续序号，从 1 开始，每条日志内无缺口。
+    fence:         写入方的栅栏世代（初始 1；promote 后严格递增）。
+    kind:          事件类型（CREATE / REFRESH / RELEASE）。
+    key:           出站四元组 (内网IP, 内网端口, 目的IP, 目的端口)。
+    at:            事件发生的时钟时刻（重放时驱动备用做同样的 housekeeping）。
+    external_port: 映射的外端口（RELEASE 时为被释放的端口）。
+    generation:    映射的 generation。
+    expires_at:    CREATE/REFRESH 为新的过期时刻；RELEASE 固定为 None。
+    """
+
+    seq: int
+    fence: int
+    kind: JournalKind
+    key: tuple[str, int, str, int]
+    at: int
+    external_port: int
+    generation: int
+    expires_at: int | None
+
+    def __post_init__(self) -> None:
+        check_int(self.seq, "JournalRecord.seq", minimum=1, maximum=MAX_TIME)
+        check_int(self.fence, "JournalRecord.fence", minimum=1, maximum=MAX_TIME)
+        if not isinstance(self.kind, JournalKind):
+            raise ValidationError(
+                f"JournalRecord.kind must be JournalKind, "
+                f"got {type(self.kind).__name__} {self.kind!r}"
+            )
+        if not (isinstance(self.key, tuple) and len(self.key) == 4):
+            raise ValidationError(
+                f"JournalRecord.key must be (ip, port, ip, port) tuple, "
+                f"got {self.key!r}"
+            )
+        check_ipv4(self.key[0], "JournalRecord.key[0] (internal ip)")
+        check_port(self.key[1], "JournalRecord.key[1] (internal port)")
+        check_ipv4(self.key[2], "JournalRecord.key[2] (remote ip)")
+        check_port(self.key[3], "JournalRecord.key[3] (remote port)")
+        check_int(self.at, "JournalRecord.at", minimum=0, maximum=MAX_TIME)
+        check_port(self.external_port, "JournalRecord.external_port")
+        check_int(self.generation, "JournalRecord.generation",
+                  minimum=1, maximum=MAX_TIME)
+        if self.kind is JournalKind.RELEASE:
+            if self.expires_at is not None:
+                raise ValidationError(
+                    f"RELEASE record must have expires_at=None, "
+                    f"got {self.expires_at!r}"
+                )
+        else:
+            if self.expires_at is None:
+                raise ValidationError(
+                    f"{self.kind.name} record requires expires_at, got None"
+                )
+            check_int(self.expires_at, "JournalRecord.expires_at",
+                      minimum=1, maximum=MAX_TIME)
+            if self.expires_at <= self.at:
+                raise ValidationError(
+                    f"JournalRecord.expires_at={self.expires_at} must be "
+                    f"> at={self.at}"
+                )

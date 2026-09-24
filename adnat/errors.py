@@ -5,7 +5,10 @@
     NATError
     ├── ValidationError            非法输入（类型/取值/NaN/Infinity/bool 整数等）
     ├── PortExhaustionError        全池扫描后容量不足（证明无解）
-    └── SearchBudgetExhaustedError 搜索预算耗尽（与证明无解分开）
+    ├── SearchBudgetExhaustedError 搜索预算耗尽（与证明无解分开）
+    ├── ReplicationGapError        备用应用记录时出现序号缺口（缺前序记录）
+    ├── CatchupIncompleteError     备用未追平指定序号就尝试接管
+    └── FencedError                旧主（或未接管的备用）的写入被栅栏世代拒绝
 
 所有异常消息均带字段名与实收值，便于定位。
 """
@@ -66,3 +69,59 @@ class SearchBudgetExhaustedError(NATError):
             f"needed={needed} found={found} (pool not fully scanned; "
             f"infeasibility NOT proven)"
         )
+
+
+class ReplicationGapError(NATError):
+    """备用应用记录时发现序号缺口：缺少前序记录，不能跳跃应用。
+
+    属性:
+        expected: 下一条期望的序号（已应用序号 + 1）。
+        got:      实收记录的序号。
+    """
+
+    def __init__(self, expected: int, got: int) -> None:
+        self.expected = expected
+        self.got = got
+        super().__init__(
+            f"replication gap: expected seq={expected}, got seq={got} "
+            f"(missing earlier records; state unchanged)"
+        )
+
+
+class CatchupIncompleteError(NATError):
+    """备用未追平指定序号就尝试接管（promote）。
+
+    属性:
+        after_seq:   调用方要求追平的序号。
+        applied_seq: 备用当前实际已应用到的序号。
+    """
+
+    def __init__(self, after_seq: int, applied_seq: int) -> None:
+        self.after_seq = after_seq
+        self.applied_seq = applied_seq
+        super().__init__(
+            f"catch-up incomplete: required after_seq={after_seq}, "
+            f"applied_seq={applied_seq} (apply missing records first)"
+        )
+
+
+class FencedError(NATError):
+    """写入被栅栏世代拒绝：旧主已失去领导权，或备用尚未接管。
+
+    属性:
+        role:            当前实例角色（"primary" / "standby"）。
+        epoch:           当前实例的世代。
+        required_epoch:  允许写入所需的最低世代；备用未接管时为 None。
+    """
+
+    def __init__(self, role: str, epoch: int,
+                 required_epoch: int | None = None) -> None:
+        self.role = role
+        self.epoch = epoch
+        self.required_epoch = required_epoch
+        if required_epoch is None:
+            detail = f"role={role} epoch={epoch} (standby not promoted)"
+        else:
+            detail = (f"role={role} epoch={epoch} < "
+                      f"required_epoch={required_epoch} (stale primary fenced)")
+        super().__init__(f"write fenced: {detail}")

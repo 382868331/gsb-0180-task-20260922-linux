@@ -2,6 +2,7 @@
 
 离线网络中间层工程的可复用模块：模拟地址依赖（address-dependent）映射与
 过滤的 UDP NAT。**纯状态库，不发任何网络包**；核心、测试、演示全部离线。
+本迭代新增**有序操作日志 + 备用复制 + 栅栏接管**能力（见下文"复制与接管"）。
 
 - Python 版本：**3.14.7**（仅标准库，语法兼容 3.10+；无需安装任何额外依赖）
 - 平台：Linux 原生
@@ -10,7 +11,7 @@
 ## 运行
 
 ```bash
-python -m unittest discover -s tests -v   # 必要测试（契约 + 差分）
+python -m unittest discover -s tests -v   # 必要测试（契约 + 差分 + 复制）
 python demo.py                            # 固定输入演示，秒级完成
 ```
 
@@ -27,7 +28,9 @@ python demo.py                            # 固定输入演示，秒级完成
   映射在 `now >= expires_at` 时过期（**边界即死**）；成功改写的包刷新
   `expires_at = now + lifetime`。
 - **隔离 Q**：映射过期或被 `release` 后，其端口隔离 `quarantine` 个时间
-  单位，`now >= released_at + Q` 才可复用。
+  单位，`now >= released_at + Q` 才可复用。**过期映射的 released_at 取
+  `expires_at`（死亡时刻，确定性）**，显式 `release` 取释放时刻——这样
+  备用重放同一日志时得到与主实例相同的隔离边界。
 - **generation**：每条映射创建时取全局单调递增序号（从 1 开始）。合成包
   可携带 `generation`；与映射当前值不一致即判**迟到包**丢弃
   （`STALE_GENERATION`）。`generation=0` 表示不参与校验。
@@ -37,6 +40,47 @@ python demo.py                            # 固定输入演示，秒级完成
   个端口。预算耗尽抛 `SearchBudgetExhaustedError`（未扫描全池，**不**
   代表无解）；全池扫描仍不够抛 `PortExhaustionError`（**证明无解**）。
 
+## 复制与接管（本迭代新增）
+
+每个实例有角色：`role="primary"`（默认，可写）或 `role="standby"`
+（只读副本）。主实例的**每次创建 / 成功包改写刷新 / 显式释放**都会向
+追加式日志写入一条 `JournalRecord`：
+
+- `seq` 从 1 连续递增；`epoch` 为当前栅栏世代；`at` 为事件时刻（单调不减）。
+- 过期回收、复用已有映射、丢弃的包、时钟推进**不产生记录**
+  （过期由时钟派生，备用重放到同一时刻自然得到相同结果）。
+
+**备用应用**（`apply_record`）：
+
+- `seq == 已应用 + 1`：应用并把时钟推进到 `record.at`；
+- `seq <= 已应用`：内容与已应用记录**完全一致**则幂等跳过
+  （`ApplyStatus.DUPLICATE`，状态不变），不一致抛 `ValidationError`；
+- `seq > 已应用 + 1`：缺前序记录，抛 `ReplicationGapError`，**状态不变**；
+- 记录与备用状态矛盾（如释放不存在的映射、创建端口被占）或时刻回退，
+  抛 `ValidationError`，**状态不变**（先纯函数校验后提交）。
+
+**栅栏接管**：
+
+- `standby.promote(after_seq=S, new_epoch=E)`：仅当已应用序号 >= S 才允许
+  接管，否则抛 `CatchupIncompleteError`；`E` 必须**严格大于日志中见过的
+  最大世代**，否则抛 `ValidationError`。成功后实例变为可写主，返回
+  `FenceToken(epoch=E, after_seq=已应用序号)`。
+- `old_primary.fence(token)`：旧主收到更高世代的凭证后进入栅栏态，
+  之后**一切写入**（allocate / translate / release / advance）抛
+  `FencedError`；只读接口不受影响。`fence` 幂等；不高于已知世代的
+  凭证在未栅栏时抛 `ValidationError`。
+- 接管后端口分配、generation、日志 seq 全部**连续递增**，不重启。
+- 未接管的备用执行写入同样抛 `FencedError`。
+
+```python
+primary = AddressDependentNAT(cfg)                    # role="primary" 默认
+standby = AddressDependentNAT(cfg, role="standby")
+for rec in primary.journal(since=standby.last_seq):   # 增量拉取日志
+    standby.apply_record(rec)
+token = standby.promote(after_seq=standby.last_seq, new_epoch=2)
+primary.fence(token)                                  # 旧主停写
+```
+
 ## 公开接口
 
 ```python
@@ -44,8 +88,10 @@ from adnat import (
     AddressDependentNAT, NATConfig, Endpoint, Packet,
     AllocationRequest, AllocationResult, TranslationResult,
     Mapping, FiveTuple, DropReason,
+    JournalRecord, RecordKind, ApplyResult, ApplyStatus, FenceToken,
     NATError, ValidationError, PortExhaustionError,
-    SearchBudgetExhaustedError,
+    SearchBudgetExhaustedError, ReplicationGapError,
+    CatchupIncompleteError, FencedError,
 )
 
 nat = AddressDependentNAT(NATConfig(
@@ -54,7 +100,7 @@ nat = AddressDependentNAT(NATConfig(
     lifetime=300,        # 映射空闲存活（整数时间单位），>= 1
     quarantine=60,       # 端口释放后隔离时长 Q，>= 0
     search_budget=None,  # 单次分配最多检查的端口数；None = 池大小（全池扫描）
-))
+), role="primary", epoch=1)   # role: "primary"/"standby"；epoch: 初始栅栏世代
 
 nat.allocate(internal: Endpoint, remote: Endpoint, *, at: int | None = None)
     -> AllocationResult
@@ -69,13 +115,28 @@ nat.advance(seconds: int) -> list[key]                      # 返回本次过期
 nat.get_mapping(key) -> Mapping | None
 nat.snapshot_mappings() -> list[Mapping]
 nat.quarantined_ports() -> dict[int, int]
-nat.stats() -> dict[str, int]
+nat.stats() -> dict[str, int]            # 含 epoch / last_seq
 nat.now -> int
+nat.role -> str                          # "primary" / "standby"
+nat.epoch -> int                         # 当前栅栏世代
+nat.is_fenced -> bool                    # 旧主是否已被栅栏
+nat.last_seq -> int                      # 日志最后一条序号（空日志为 0）
+
+# 复制与接管
+nat.journal(*, since: int = 0) -> list[JournalRecord]   # seq > since 的记录
+nat.apply_record(record: JournalRecord) -> ApplyResult  # 仅备用
+nat.promote(*, after_seq: int, new_epoch: int) -> FenceToken  # 仅备用
+nat.fence(token: FenceToken) -> None                    # 栅栏本实例
 ```
 
 `TranslationResult.accepted=True` 时 `rewritten` 为改写后的 `FiveTuple`
 （UDP，protocol=17）；否则 `reason` 为 `DropReason` 之一：
 `NO_MAPPING` / `STALE_GENERATION` / `PEER_MISMATCH` / `DEST_MISMATCH`。
+
+`JournalRecord` 字段：`seq / epoch / kind / key / at`，以及按 kind
+而定的负载——`CREATE` 带 `port / generation / expires_at`，
+`REFRESH` 带 `expires_at`，`RELEASE` 无负载。构造时即校验，
+非法组合（如 REFRESH 带 port）抛 `ValidationError`。
 
 ## 错误语义
 
@@ -83,9 +144,12 @@ nat.now -> int
 
 | 异常 | 含义 | 状态影响 |
 |---|---|---|
-| `ValidationError` | 非法输入（类型/取值/越界/时钟回退/批内重复 key 等） | 在任何变更之前抛出，状态不变 |
+| `ValidationError` | 非法输入（类型/取值/越界/时钟回退/批内重复 key/记录矛盾等） | 在任何变更之前抛出，状态不变 |
 | `PortExhaustionError` | 全池扫描后容量不足（证明无解），带 `needed/available/pool_size` | 整体回滚，状态不变 |
 | `SearchBudgetExhaustedError` | 搜索预算耗尽（未证明无解），带 `budget/inspected/needed/found` | 整体回滚，状态不变 |
+| `ReplicationGapError` | 备用收到跳号记录，带 `expected/got` | 状态不变 |
+| `CatchupIncompleteError` | 未追平 `after_seq` 就接管，带 `after_seq/applied_seq` | 状态不变 |
+| `FencedError` | 旧主已栅栏或备用未接管时的写入，带 `role/epoch/required_epoch` | 状态不变 |
 
 输入校验规则（全库统一）：整数参数只接受精确 `int`；**`bool` 一律拒绝**；
 `float`（含 `3.0`）一律拒绝，因此 **NaN/Infinity 在类型层即被拒绝**；
@@ -100,19 +164,22 @@ IPv4 只接受规范点分十进制（无前导零）。错误消息均带字段
 | 端口池大小 | 1..65535（`MAX_POOL_SIZE`），且无重复 |
 | 单批分配请求数 | `MAX_BATCH_REQUESTS` = 65535，且批内 key 不重复 |
 | 时间类整数（`at`/`advance`/`lifetime`/`quarantine` 等） | 0..2^63-1（`MAX_TIME`），且 `now + lifetime` 不得溢出 |
-| `generation` | 0..2^63-1 |
+| `generation` / `seq` / `epoch` | 0..2^63-1（`seq`/`epoch` 从 1 起） |
 
 ## 精度说明（误差口径）
 
 本库**不产生浮点结果**：所有计算（端口选择、过期判定、隔离判定、
-generation 比较）均为精确整数运算，比较采用严格不等式
-（`now >= expires_at` 过期、`now >= released_at + Q` 解除隔离），
-边界行为由 `tests/test_contract.py` 中的边界用例逐点固定，无容差。
+generation / seq / epoch 比较）均为精确整数运算，比较采用严格不等式
+（`now >= expires_at` 过期、`now >= released_at + Q` 解除隔离、
+`new_epoch > max_epoch_seen` 才可接管），边界行为由
+`tests/test_contract.py` 与 `tests/test_replication.py` 中的边界用例
+逐点固定，无容差。
 
 ## 设计取舍
 
 - **纯函数规划 + 一次性提交**：批量分配把"校验/容量规划"与"状态提交"
-  分开，从结构上保证失败即零副作用，而非事后补偿回滚。
+  分开，从结构上保证失败即零副作用，而非事后补偿回滚。备用应用记录
+  同样先纯函数校验（序号、时刻、与本地状态一致性）再提交。
 - **每次调用做 housekeeping**：任何公开操作都会先把时钟推进到本次
   请求时刻（默认当前时钟），保证"过期即不可见"不依赖显式 `advance`；
   `advance` 仍是驱动时间的主要入口并返回过期清单。
@@ -120,31 +187,46 @@ generation 比较）均为精确整数运算，比较采用严格不等式
   只有成功的包改写刷新（模拟真实流量保活）。
 - **`generation=0` 豁免**：不知道代号的调用方（如首包）可传 0 跳过
   迟到校验，避免强制所有调用方跟踪代号。
-- **参考实现独立**：`tests/reference_nat.py` 只用字典/元组重写同一契约，
-  不导入被测核心；差分测试逐操作比对公开结果与规范化状态签名。
+- **日志只记显式事件**：过期回收不写日志——它由时钟与 `expires_at`
+  派生，备用重放到同一时刻自然得到相同结果。为让派生结果确定，
+  过期映射的隔离时间戳取 `expires_at` 而非观测时刻。
+- **备用时钟由日志驱动**：`apply_record` 把备用时钟推进到记录时刻；
+  备用不允许 `advance`（写入门禁的一部分），保证主备时钟一致。
+- **栅栏是单向的**：`fence` 只接受更高世代凭证，且效果幂等；
+  本库不做"解除栅栏"。
+- **参考实现独立**：`tests/reference_nat.py` 只用字典/元组重写同一契约
+  （含 `RefStandby` 日志重放器），不导入被测核心；差分测试逐操作比对
+  公开结果与规范化状态签名。
 
 ## 已知限制
 
 - 仅 UDP（protocol 固定 17）；仅地址依赖映射 + 地址依赖过滤，不含
   端口依赖/锥形 NAT、hairpin、ALG、分片、ICMP 等行为。
-- 单实例、单线程；状态只在内存中，无持久化。
+- 单实例、单线程；状态只在内存中，无持久化；日志保存在内存列表中，
+  不做压缩/截断，实例间日志传输由调用方负责（`journal(since=)` 仅
+  提供增量读取）。
 - 端口分配为"最小空闲"策略的线性扫描，复杂度 O(池大小)；
   本题上限（65535）下足够。
 - 出站方向无映射时**丢弃**而非隐式建映射（建映射必须显式 `allocate`）。
 - 时钟接近 `MAX_TIME` 时（`now + lifetime` 溢出）抛 `ValidationError`。
+- **接管要求备用已追平**（`after_seq`）；备用落后时的无损接管、
+  日志缺口自动回补、多备用与选主协议均不在本迭代范围。
+- 旧主被栅栏后仍保留全部只读状态；不会自动清空或退出。
 
 ## 目录
 
 ```
 adnat/            本题库（可导入）
   __init__.py     公开导出
-  model.py        冻结数据结构 + NATConfig
+  model.py        冻结数据结构 + NATConfig + JournalRecord/FenceToken
   errors.py       异常层级
-  core.py         AddressDependentNAT 核心
+  core.py         AddressDependentNAT 核心（含日志/复制/栅栏）
   _validate.py    输入校验原语
 tests/
-  test_contract.py      契约测试（手工期望值）
-  test_differential.py  差分测试（核心 vs 独立字典参考）
-  reference_nat.py      独立字典参考实现（测试 oracle）
+  test_contract.py              契约测试（手工期望值）
+  test_differential.py          差分测试（核心 vs 独立字典参考）
+  test_replication.py           复制/接管契约测试（手工期望值）
+  test_replication_differential.py  复制链路差分测试（含接管后行为）
+  reference_nat.py              独立字典参考实现（测试 oracle，含 RefStandby）
 demo.py           固定输入演示
 ```

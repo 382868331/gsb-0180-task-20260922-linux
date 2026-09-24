@@ -107,10 +107,10 @@ class RefNAT:
     def _housekeep(self, now):
         expired = self._expired(now)
         for k in expired:
-            port = self.maps[k][0]
+            port, _, _, _, exp = self.maps[k]
             del self.maps[k]
             del self.port_owner[port]
-            self.quarantined[port] = now
+            self.quarantined[port] = exp   # 隔离自死亡时刻起算（确定性）
         for p in [p for p, t in self.quarantined.items()
                   if now >= t + self.quarantine]:
             del self.quarantined[p]
@@ -228,3 +228,86 @@ class RefNAT:
         ))
         quar = tuple(sorted(self.quarantined.items()))
         return (self.now, live, quar, self.next_gen)
+
+
+class RefStandby:
+    """字典版备用实例：独立重放有序日志（不导入 adnat，纯字典实现）。
+
+    apply(rec) 接收记录的元组形式：
+        rec = (seq, epoch, kind, key, at, port, generation, expires_at)
+        kind ∈ {"create", "refresh", "release"}；不适用字段为 None。
+    返回 "applied" / "duplicate"；缺口抛 RefError("gap", ...)，
+    其余非法/不一致抛 RefError("validation", ...)，失败时状态不变。
+    """
+
+    def __init__(self, ports, lifetime, quarantine):
+        self.ports = tuple(sorted(ports))
+        self.lifetime = lifetime
+        self.quarantine = quarantine
+        self.now = 0
+        self.maps = {}          # key -> [port, gen, created, last_seen, expires]
+        self.port_owner = {}    # port -> key
+        self.quarantined = {}   # port -> released_at
+        self.applied = {}       # seq -> rec[1:]（已应用记录内容）
+
+    def apply(self, rec):
+        seq, _epoch, kind, key, at, port, gen, exp = rec
+        if not _is_int(seq) or seq < 1:
+            raise RefError("validation", f"bad seq {seq!r}")
+        if seq in self.applied:
+            if self.applied[seq] != rec[1:]:
+                raise RefError("validation",
+                               f"seq={seq} conflicts with applied record")
+            return "duplicate"
+        if seq != len(self.applied) + 1:
+            raise RefError("gap",
+                           f"expected seq={len(self.applied) + 1} got {seq}")
+        if not _is_int(at) or at < self.now:
+            raise RefError("validation", f"bad at {at!r}")
+        # ---- 纯函数一致性校验（不改状态） ----
+        live = {k for k, r in self.maps.items() if at < r[4]}
+        if kind == "create":
+            if key in live:
+                raise RefError("validation", "create: key already live")
+            used = {self.maps[k][0] for k in live}
+            if port in used:
+                raise RefError("validation", "create: port in use")
+            hot = {p for p, t in self.quarantined.items()
+                   if at < t + self.quarantine}
+            if port in hot:
+                raise RefError("validation", "create: port quarantined")
+        elif kind in ("refresh", "release"):
+            if key not in live:
+                raise RefError("validation", f"{kind}: no live mapping")
+        else:
+            raise RefError("validation", f"bad kind {kind!r}")
+        # ---- 提交：housekeeping 到记录时刻，再应用记录效果 ----
+        for k in [k for k, r in self.maps.items() if at >= r[4]]:
+            p, _, _, _, exp_at = self.maps[k]
+            del self.maps[k]
+            del self.port_owner[p]
+            self.quarantined[p] = exp_at   # 隔离自死亡时刻起算（确定性）
+        for p in [p for p, t in self.quarantined.items()
+                  if at >= t + self.quarantine]:
+            del self.quarantined[p]
+        self.now = at
+        if kind == "create":
+            self.maps[key] = [port, gen, at, at, exp]
+            self.port_owner[port] = key
+        elif kind == "refresh":
+            self.maps[key][3] = at
+            self.maps[key][4] = exp
+        else:  # release
+            p = self.maps.pop(key)[0]
+            del self.port_owner[p]
+            self.quarantined[p] = at
+        self.applied[seq] = rec[1:]
+        return "applied"
+
+    def signature(self):
+        """规范化状态：时钟、活跃映射内容、隔离表、已应用序号数。"""
+        live = tuple(sorted(
+            (k, tuple(v)) for k, v in self.maps.items() if self.now < v[4]
+        ))
+        return (self.now, live, tuple(sorted(self.quarantined.items())),
+                len(self.applied))

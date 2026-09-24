@@ -5,8 +5,11 @@
 
 from .core import AddressDependentNAT
 from .errors import (
+    CatchupIncompleteError,
+    FencedError,
     NATError,
     PortExhaustionError,
+    ReplicationGapError,
     SearchBudgetExhaustedError,
     ValidationError,
 )
@@ -16,12 +19,17 @@ from .model import (
     MAX_TIME,
     AllocationRequest,
     AllocationResult,
+    ApplyResult,
+    ApplyStatus,
     DropReason,
     Endpoint,
+    FenceToken,
     FiveTuple,
+    JournalRecord,
     Mapping,
     NATConfig,
     Packet,
+    RecordKind,
     TranslationResult,
 )
 
@@ -31,6 +39,9 @@ __all__ = [
     "ValidationError",
     "PortExhaustionError",
     "SearchBudgetExhaustedError",
+    "ReplicationGapError",
+    "CatchupIncompleteError",
+    "FencedError",
     "Endpoint",
     "FiveTuple",
     "Packet",
@@ -40,9 +51,14 @@ __all__ = [
     "TranslationResult",
     "DropReason",
     "NATConfig",
+    "JournalRecord",
+    "RecordKind",
+    "ApplyResult",
+    "ApplyStatus",
+    "FenceToken",
     "MAX_TIME",
     "MAX_BATCH_REQUESTS",
     "MAX_POOL_SIZE",
 ]
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"

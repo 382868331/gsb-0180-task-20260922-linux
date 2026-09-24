@@ -9,7 +9,7 @@ from __future__ import annotations
 import enum
 from dataclasses import dataclass
 
-from ._validate import check_int, check_ipv4, check_port
+from ._validate import check_int, check_ipv4, check_mapping_key, check_port
 from .errors import ValidationError
 
 #: 时间与计数类整数的统一上限（含），避免无界整数被误用。
@@ -36,6 +36,29 @@ class DropReason(enum.Enum):
 
     DEST_MISMATCH = "dest_mismatch"
     """入站包目的地址不是本 NAT 的固定公网 IP。"""
+
+
+class RecordKind(enum.Enum):
+    """有序操作记录的种类（映射生命周期事件）。"""
+
+    CREATE = "create"
+    """新建映射（含外端口、generation 与过期时刻）。"""
+
+    REFRESH = "refresh"
+    """成功包改写刷新映射的 last_seen / expires_at。"""
+
+    RELEASE = "release"
+    """映射被显式释放（或过期回收），端口进入隔离。"""
+
+
+class ApplyStatus(enum.Enum):
+    """备用应用一条记录的结果状态。"""
+
+    APPLIED = "applied"
+    """按序应用成功，状态已推进。"""
+
+    DUPLICATE = "duplicate"
+    """序号 <= 已应用序号且内容与已应用记录完全一致：幂等跳过，无变更。"""
 
 
 @dataclass(frozen=True, slots=True)
@@ -160,6 +183,95 @@ class TranslationResult:
     rewritten: FiveTuple | None
     reason: DropReason | None
     mapping: Mapping | None
+
+
+@dataclass(frozen=True, slots=True)
+class JournalRecord:
+    """主实例为映射生命周期事件生成的有序记录（追加式日志的一项）。
+
+    seq:      全局单调递增序号（每个实例内从 1 开始，接管后连续递增）。
+    epoch:    生成该记录的主实例栅栏世代。
+    kind:     CREATE / REFRESH / RELEASE。
+    key:      出站四元组 (内网IP, 内网端口, 目的IP, 目的端口)。
+    at:       事件发生的虚拟时钟时刻（主实例上单调不减）。
+    port:     仅 CREATE：分配的外端口。
+    generation: 仅 CREATE：新映射的 generation。
+    expires_at: CREATE/REFRESH：事件后的过期时刻。
+    """
+
+    seq: int
+    epoch: int
+    kind: RecordKind
+    key: tuple[str, int, str, int]
+    at: int
+    port: int | None = None
+    generation: int | None = None
+    expires_at: int | None = None
+
+    def __post_init__(self) -> None:
+        check_int(self.seq, "JournalRecord.seq", minimum=1, maximum=MAX_TIME)
+        check_int(self.epoch, "JournalRecord.epoch", minimum=1, maximum=MAX_TIME)
+        if not isinstance(self.kind, RecordKind):
+            raise ValidationError(
+                f"JournalRecord.kind must be RecordKind, "
+                f"got {type(self.kind).__name__}"
+            )
+        check_mapping_key(self.key, "JournalRecord.key")
+        check_int(self.at, "JournalRecord.at", minimum=0, maximum=MAX_TIME)
+        if self.kind is RecordKind.CREATE:
+            if self.port is None or self.generation is None \
+                    or self.expires_at is None:
+                raise ValidationError(
+                    "JournalRecord CREATE requires port, generation, expires_at"
+                )
+            check_port(self.port, "JournalRecord.port")
+            check_int(self.generation, "JournalRecord.generation",
+                      minimum=1, maximum=MAX_TIME)
+            check_int(self.expires_at, "JournalRecord.expires_at",
+                      minimum=0, maximum=MAX_TIME)
+        elif self.kind is RecordKind.REFRESH:
+            if self.expires_at is None:
+                raise ValidationError("JournalRecord REFRESH requires expires_at")
+            check_int(self.expires_at, "JournalRecord.expires_at",
+                      minimum=0, maximum=MAX_TIME)
+            if self.port is not None or self.generation is not None:
+                raise ValidationError(
+                    "JournalRecord REFRESH must not carry port/generation"
+                )
+        else:  # RELEASE
+            if self.port is not None or self.generation is not None \
+                    or self.expires_at is not None:
+                raise ValidationError(
+                    "JournalRecord RELEASE must not carry "
+                    "port/generation/expires_at"
+                )
+
+
+@dataclass(frozen=True, slots=True)
+class FenceToken:
+    """接管凭证：新主世代与接管时点已追平的序号。
+
+    交给旧主的 fence(token) 使用；只有 token.epoch 严格大于旧主当前
+    世代才能成功栅栏旧主。
+    """
+
+    epoch: int
+    after_seq: int
+
+    def __post_init__(self) -> None:
+        check_int(self.epoch, "FenceToken.epoch", minimum=1, maximum=MAX_TIME)
+        check_int(self.after_seq, "FenceToken.after_seq",
+                  minimum=0, maximum=MAX_TIME)
+
+
+@dataclass(frozen=True, slots=True)
+class ApplyResult:
+    """备用应用一条记录的结果。"""
+
+    status: ApplyStatus
+    seq: int
+    kind: RecordKind
+
 
 
 @dataclass(frozen=True, slots=True)

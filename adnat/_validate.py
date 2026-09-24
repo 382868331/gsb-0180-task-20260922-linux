@@ -58,3 +58,16 @@ def check_ipv4(value: object, name: str) -> str:
             f"{name}={value!r} is not canonical dotted-decimal ({addr})"
         )
     return value
+
+
+def check_mapping_key(value: object, name: str) -> tuple[str, int, str, int]:
+    """出站映射 key：(内网IP, 内网端口, 目的IP, 目的端口) 四元组。"""
+    if not (isinstance(value, tuple) and len(value) == 4):
+        raise ValidationError(
+            f"{name} must be (ip, port, ip, port) tuple, got {value!r}"
+        )
+    check_ipv4(value[0], f"{name}[0] (internal ip)")
+    check_port(value[1], f"{name}[1] (internal port)")
+    check_ipv4(value[2], f"{name}[2] (remote ip)")
+    check_port(value[3], f"{name}[3] (remote port)")
+    return value

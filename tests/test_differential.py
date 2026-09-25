@@ -17,6 +17,7 @@ from adnat import (
     NATConfig,
     Packet,
     PortExhaustionError,
+    QuotaExceededError,
     SearchBudgetExhaustedError,
     ValidationError,
 )
@@ -31,6 +32,7 @@ KEYS = [(i.ip, i.port, r.ip, r.port) for i in INTERNALS for r in REMOTES]
 
 
 def core_signature(nat: AddressDependentNAT):
+    # 隐式默认租户模式：身份剥成租户内 key（与参考 signature() 同形）。
     live = tuple(sorted(
         (m.key, (m.external_port, m.generation, m.created_at,
                  m.last_seen, m.expires_at))
@@ -45,6 +47,8 @@ def ref_signature(ref: RefNAT):
 
 
 def core_tag(exc: Exception) -> str:
+    if isinstance(exc, QuotaExceededError):
+        return "quota_exceeded"
     if isinstance(exc, PortExhaustionError):
         return "port_exhausted"
     if isinstance(exc, SearchBudgetExhaustedError):
@@ -63,8 +67,9 @@ def ref_tag(exc: Exception) -> str:
 def norm_core_translation(res):
     if res.accepted:
         f = res.rewritten
-        return ("ok", (f.protocol, f.src_ip, f.src_port, f.dst_ip, f.dst_port))
-    return ("drop", res.reason.value)
+        return ("ok", (f.protocol, f.src_ip, f.src_port, f.dst_ip, f.dst_port),
+                res.tenant)
+    return ("drop", res.reason.value, res.tenant)
 
 
 class Pair:

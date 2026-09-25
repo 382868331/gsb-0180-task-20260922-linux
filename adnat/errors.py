@@ -5,7 +5,8 @@
     NATError
     ├── ValidationError            非法输入（类型/取值/NaN/Infinity/bool 整数等）
     ├── PortExhaustionError        全池扫描后容量不足（证明无解）
-    └── SearchBudgetExhaustedError 搜索预算耗尽（与证明无解分开）
+    ├── SearchBudgetExhaustedError 搜索预算耗尽（与证明无解分开）
+    └── QuotaExceededError         租户活跃映射配额不足（与端口容量分开）
 
 所有异常消息均带字段名与实收值，便于定位。
 """
@@ -25,20 +26,24 @@ class ValidationError(NATError, ValueError):
 
 
 class PortExhaustionError(NATError):
-    """容量不足且已证明无解：扫描了整个端口池仍凑不齐所需空闲端口。
+    """容量不足且已证明无解：扫描了整个租户端口子集仍凑不齐所需空闲端口。
 
     属性:
-        needed:    本次需要的新端口数。
+        needed:    本次（该租户）需要的新端口数。
         available: 当前（含时间推进后的过期回收）可用端口数。
-        pool_size: 端口池总大小。
+        pool_size: 该租户端口子集总大小。
+        tenant:    容量不足的租户 ID；默认租户（无租户配置）为 ""。
     """
 
-    def __init__(self, needed: int, available: int, pool_size: int) -> None:
+    def __init__(self, needed: int, available: int, pool_size: int,
+                 tenant: str = "") -> None:
         self.needed = needed
         self.available = available
         self.pool_size = pool_size
+        self.tenant = tenant
+        where = f"tenant={tenant!r} " if tenant else ""
         super().__init__(
-            f"port pool exhausted: needed={needed} available={available} "
+            f"port pool exhausted: {where}needed={needed} available={available} "
             f"pool_size={pool_size} (full scan proves infeasible)"
         )
 
@@ -49,20 +54,54 @@ class SearchBudgetExhaustedError(NATError):
     与 PortExhaustionError 分开：此时并未扫描全池，不能断定无解，
     只是预算内找不到。调大 search_budget 后可能成功。
 
+    跨租户批量中预算在所有租户子集间共享（按实际检查的端口计数累加）；
+    tenant 给出触发耗尽时正在规划的租户。
+
     属性:
         budget:    生效的搜索预算（最多检查的端口数）。
         inspected: 实际检查过的端口数（== budget）。
-        needed:    本次需要的新端口数。
-        found:     预算内找到的空闲端口数。
+        needed:    触发耗尽的租户本次需要的新端口数。
+        found:     该租户预算内找到的空闲端口数。
+        tenant:    触发耗尽时正在规划的租户 ID（默认租户为 ""）。
     """
 
-    def __init__(self, budget: int, inspected: int, needed: int, found: int) -> None:
+    def __init__(self, budget: int, inspected: int, needed: int, found: int,
+                 tenant: str = "") -> None:
         self.budget = budget
         self.inspected = inspected
         self.needed = needed
         self.found = found
+        self.tenant = tenant
+        where = f"tenant={tenant!r} " if tenant else ""
         super().__init__(
-            f"port search budget exhausted: budget={budget} inspected={inspected} "
-            f"needed={needed} found={found} (pool not fully scanned; "
-            f"infeasibility NOT proven)"
+            f"port search budget exhausted: {where}budget={budget} "
+            f"inspected={inspected} needed={needed} found={found} "
+            f"(pool not fully scanned; infeasibility NOT proven)"
+        )
+
+
+class QuotaExceededError(NATError):
+    """租户活跃映射配额不足：候选时刻回收过期映射后仍会超过 max_active。
+
+    与端口容量严格分开：即使该租户端口子集还有空闲端口，只要活跃数
+    （含本批新建、不含复用与已过期）超过配额就报本异常，绝不伪装成
+    PortExhaustionError。
+
+    属性:
+        tenant:    超配额的租户 ID。
+        active:    候选时刻（过期回收后）该租户已有活跃映射数。
+        requested: 本批为该租户新建的映射数（复用不计）。
+        limit:     该租户 max_active_mappings。
+    """
+
+    def __init__(self, tenant: str, active: int, requested: int,
+                 limit: int) -> None:
+        self.tenant = tenant
+        self.active = active
+        self.requested = requested
+        self.limit = limit
+        super().__init__(
+            f"tenant quota exceeded: tenant={tenant!r} active={active} "
+            f"requested_new={requested} limit={limit} "
+            f"(active + requested = {active + requested} > {limit})"
         )

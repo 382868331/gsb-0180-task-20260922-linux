@@ -120,8 +120,12 @@ class RefNAT:
     def _plan(self, count, now):
         expired = self._expired(now)
         used = {r[0] for k, r in self.maps.items() if k not in expired}
+        # 隔离集合按候选时刻 housekeeping 后的投影：将在 now 过期回收的
+        # 端口提交时即以 now 进入隔离，Q>0 时本次不可分配（隔离期不可跳过）。
         quar = {p for p, t in self.quarantined.items()
                 if now < t + self.quarantine}
+        if self.quarantine > 0:
+            quar |= {r[0] for k, r in self.maps.items() if k in expired}
         chosen, inspected = [], 0
         for p in self.ports:
             if len(chosen) == count:

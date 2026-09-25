@@ -10,8 +10,8 @@
 ## 运行
 
 ```bash
-python -m unittest discover -s tests -v   # 必要测试（契约 + 差分）
-python demo.py                            # 固定输入演示，秒级完成
+./.venv/bin/python -m unittest discover -s tests -v   # 必要测试（契约 + hairpin + 差分）
+./.venv/bin/python demo.py                            # 固定输入演示，秒级完成
 ```
 
 ## 模型与契约
@@ -22,6 +22,15 @@ python demo.py                            # 固定输入演示，秒级完成
   （池可乱序给出，内部升序去重）。
 - **入站过滤**：包必须命中某映射的外端口，且源端点 == 该映射记录的对端，
   目的 IP == 公网 IP，否则丢弃。
+- **hairpin（发夹折返）**：`translate_hairpin` 是入站过滤的**显式例外
+  入口**——内网源访问本 NAT 公网 IP 上仍有效映射的外端口时，目的被改写
+  为该映射的内网端点，同时源按出站规则取得（或复用）自己的出站映射并
+  改写为 `(公网IP, 源映射外端口)`。普通入站 `translate_inbound` 的规则
+  不因本入口存在而放宽。目的映射必须属于当前公网 IP 且未过期（隔离期
+  端口不可作目的）；目的查找、源分配与双方计时刷新**一次提交**——源端口
+  池耗尽抛 `PortExhaustionError` 时状态与调用前完全一致（目的映射的
+  计时也不变）。自己访问自己的映射允许；源 key 与目的 key 相同时只复用，
+  不重复占用容量。
 - **时间**：显式整数时钟。`advance(seconds)` 推进；每次公开调用先按当前
   时钟做 housekeeping（过期回收、隔离到期释放）再处理请求。时钟只增不减。
   映射在 `now >= expires_at` 时过期（**边界即死**）；成功改写的包刷新
@@ -43,7 +52,7 @@ python demo.py                            # 固定输入演示，秒级完成
 from adnat import (
     AddressDependentNAT, NATConfig, Endpoint, Packet,
     AllocationRequest, AllocationResult, TranslationResult,
-    Mapping, FiveTuple, DropReason,
+    HairpinResult, Mapping, FiveTuple, DropReason,
     NATError, ValidationError, PortExhaustionError,
     SearchBudgetExhaustedError,
 )
@@ -64,6 +73,8 @@ nat.translate_outbound(packet: Packet, *, at: int | None = None)
     -> TranslationResult                 # 不隐式建映射；无映射丢弃
 nat.translate_inbound(packet: Packet, *, at: int | None = None)
     -> TranslationResult
+nat.translate_hairpin(packet: Packet, *, at: int | None = None)
+    -> HairpinResult                     # 内网源访问本 NAT 公网端点 -> 折返
 nat.release(key: tuple, *, at: int | None = None) -> bool   # 不存在返回 False
 nat.advance(seconds: int) -> list[key]                      # 返回本次过期的 key
 nat.get_mapping(key) -> Mapping | None
@@ -76,6 +87,39 @@ nat.now -> int
 `TranslationResult.accepted=True` 时 `rewritten` 为改写后的 `FiveTuple`
 （UDP，protocol=17）；否则 `reason` 为 `DropReason` 之一：
 `NO_MAPPING` / `STALE_GENERATION` / `PEER_MISMATCH` / `DEST_MISMATCH`。
+
+`HairpinResult.accepted=True` 时 `rewritten` 为折返后的 `FiveTuple`
+（源 = `(公网IP, 源映射外端口)`，目的 = 被访问映射的内网端点），
+`source_mapping` / `destination_mapping` 给出双方映射快照（含双方
+`generation`）；`accepted=False` 时 `reason` 为 `NO_MAPPING`（目的端口
+无活跃映射，含已过期或处于隔离期）/ `STALE_GENERATION`（包携带的
+generation 与目的映射不一致）/ `DEST_MISMATCH`（目的不是本 NAT 公网
+IP）。源端需要新端口而池耗尽时抛 `PortExhaustionError`（或预算耗尽抛
+`SearchBudgetExhaustedError`），状态与调用前完全一致。
+
+### hairpin 示例
+
+```python
+from adnat import AddressDependentNAT, NATConfig, Endpoint, Packet
+
+nat = AddressDependentNAT(NATConfig(
+    public_ip="203.0.113.7", external_ports=(6100, 6101, 6102),
+    lifetime=300, quarantine=60,
+))
+a = Endpoint("10.0.0.8", 40000)          # 内网端点 A
+b = Endpoint("10.0.0.9", 40001)          # 内网端点 B
+m_b = nat.allocate(b, Endpoint("198.51.100.10", 53)).mapping
+# B 的映射: 10.0.0.9:40001 <-> 203.0.113.7:6100 (gen=1)
+
+# A 访问 B 的公网端点 -> 折返到 B；A 同时取得自己的出站映射 (gen=2)
+res = nat.translate_hairpin(
+    Packet(src=a, dst=Endpoint("203.0.113.7", m_b.external_port),
+           generation=m_b.generation))
+assert res.accepted
+# res.rewritten      = (17, 203.0.113.7:6101 -> 10.0.0.9:40001)
+# res.source_mapping.generation      == 2   (A 的新映射，外端口 6101)
+# res.destination_mapping.generation == 1   (B 的映射)
+```
 
 ## 错误语义
 
@@ -118,6 +162,12 @@ generation 比较）均为精确整数运算，比较采用严格不等式
   `advance` 仍是驱动时间的主要入口并返回过期清单。
 - **复用不刷新**：`allocate` 命中已有映射只复用，不刷新过期时间；
   只有成功的包改写刷新（模拟真实流量保活）。
+- **hairpin 是独立入口而非放宽入站**：折返只允许经 `translate_hairpin`
+  发生；`translate_inbound` 的地址依赖过滤逐字保持不变。hairpin 内部
+  同样是"纯函数规划 + 一次性提交"：目的查找、源端口规划与双方计时
+  刷新要么一起生效，要么（源端口耗尽/预算耗尽时）零副作用——目的
+  映射的 `last_seen`/`expires_at` 也不变。源 key 与目的 key 相同的
+  自访问情形只复用该映射，不重复占用端口。
 - **`generation=0` 豁免**：不知道代号的调用方（如首包）可传 0 跳过
   迟到校验，避免强制所有调用方跟踪代号。
 - **参考实现独立**：`tests/reference_nat.py` 只用字典/元组重写同一契约，
@@ -125,8 +175,10 @@ generation 比较）均为精确整数运算，比较采用严格不等式
 
 ## 已知限制
 
-- 仅 UDP（protocol 固定 17）；仅地址依赖映射 + 地址依赖过滤，不含
-  端口依赖/锥形 NAT、hairpin、ALG、分片、ICMP 等行为。
+- 仅 UDP（protocol 固定 17）；仅地址依赖映射 + 地址依赖过滤，外加
+  显式的 hairpin 折返入口；不含端口依赖/锥形 NAT、ALG、分片、ICMP
+  等行为。hairpin 不过滤源端点（任何源访问活跃映射的公网端点都会
+  被折返），且折返只改写首包方向，不维护连接级状态。
 - 单实例、单线程；状态只在内存中，无持久化。
 - 端口分配为"最小空闲"策略的线性扫描，复杂度 O(池大小)；
   本题上限（65535）下足够。
@@ -144,7 +196,8 @@ adnat/            本题库（可导入）
   _validate.py    输入校验原语
 tests/
   test_contract.py      契约测试（手工期望值）
+  test_hairpin.py       hairpin 入口契约测试（手工五元组表，两方向）
   test_differential.py  差分测试（核心 vs 独立字典参考）
   reference_nat.py      独立字典参考实现（测试 oracle）
-demo.py           固定输入演示
+demo.py           固定输入演示（含 hairpin 两方向折返）
 ```

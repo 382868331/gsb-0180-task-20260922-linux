@@ -8,6 +8,8 @@
      a. 端口池耗尽 -> 批量分配抛 PortExhaustionError 并整体回滚；
      b. 入站对端不匹配 -> 丢弃（PEER_MISMATCH）；
      c. 映射重建后旧 generation 的迟到包 -> 丢弃（STALE_GENERATION）。
+  3. hairpin：内网端点访问本 NAT 公网端点的包被折返（两方向）。
+  4. 时钟推进与过期。
 """
 
 from __future__ import annotations
@@ -99,13 +101,45 @@ def main() -> None:
     print(f"    当前包(gen={m1b.generation}) accepted={fresh.accepted}")
     assert not late.accepted and fresh.accepted
 
-    print("\n[3] 时钟推进与过期")
+    print("\n[3] hairpin：内网端点访问本 NAT 公网端点 -> 折返（两方向）")
+    print("    （前面端口池已占满，本节用独立实例演示）")
+    hnat = AddressDependentNAT(NATConfig(
+        public_ip=PUB, external_ports=POOL, lifetime=30, quarantine=10,
+    ))
+    peer = Endpoint("10.0.0.10", 40000)
+    m_peer = hnat.allocate(peer, WEB_A).mapping
+    print(f"    对端映射: {peer.ip}:{peer.port} 经 {PUB}:{m_peer.external_port}"
+          f" (gen={m_peer.generation}) 访问 {WEB_A.ip}:{WEB_A.port}")
+    fwd = hnat.translate_hairpin(
+        Packet(src=HOST, dst=Endpoint(PUB, m_peer.external_port),
+               generation=m_peer.generation))
+    print(f"  方向1 {HOST.ip}:{HOST.port} -> {PUB}:{m_peer.external_port} 折返:")
+    show_five("五元组", fwd.rewritten)
+    print(f"    源映射 gen={fwd.source_mapping.generation}"
+          f" 外端口={fwd.source_mapping.external_port};"
+          f" 目的映射 gen={fwd.destination_mapping.generation}")
+    assert fwd.rewritten.dst_ip == peer.ip and fwd.rewritten.dst_port == peer.port
+    back = hnat.translate_hairpin(
+        Packet(src=peer, dst=Endpoint(PUB, fwd.source_mapping.external_port),
+               generation=fwd.source_mapping.generation))
+    print(f"  方向2 {peer.ip}:{peer.port} -> {PUB}:{fwd.source_mapping.external_port} 折返:")
+    show_five("五元组", back.rewritten)
+    assert back.rewritten.dst_ip == HOST.ip and back.rewritten.dst_port == HOST.port
+    # 普通入站不被放宽：同一内网包走 translate_inbound 仍被对端过滤。
+    not_loosened = hnat.translate_inbound(
+        Packet(src=HOST, dst=Endpoint(PUB, m_peer.external_port)))
+    print(f"    普通入站不受影响: {HOST.ip}:{HOST.port} -> "
+          f"{PUB}:{m_peer.external_port} accepted={not_loosened.accepted}"
+          f" reason={not_loosened.reason.value}")
+    assert not not_loosened.accepted
+
+    print("\n[4] 时钟推进与过期")
     expired = nat.advance(30)   # 所有映射 lifetime=30 到期
     print(f"    advance(30) 过期映射数: {len(expired)}, "
           f"剩余活跃映射: {nat.stats()['live_mappings']}")
     assert nat.stats()["live_mappings"] == 0
 
-    print("\n演示完成：正常路径与三类拒绝/异常边界均按预期发生。")
+    print("\n演示完成：正常路径、hairpin 折返与三类拒绝/异常边界均按预期发生。")
 
 
 if __name__ == "__main__":

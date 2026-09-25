@@ -163,6 +163,25 @@ class TranslationResult:
 
 
 @dataclass(frozen=True, slots=True)
+class HairpinResult:
+    """hairpin 改写结果。
+
+    accepted=True 时：rewritten 为改写后的五元组（源已按出站规则换成
+    (公网IP, 源映射外端口)，目的已折回被访问映射的内网端点），
+    source_mapping / destination_mapping 分别为源端点的出站映射与
+    被访问的目的映射快照，双方 generation 可从二者读取。
+    accepted=False 时 rewritten 为 None，reason 给出丢弃原因；
+    destination_mapping 在已定位到目的映射时给出（如 STALE_GENERATION）。
+    """
+
+    accepted: bool
+    rewritten: FiveTuple | None
+    reason: DropReason | None
+    source_mapping: Mapping | None
+    destination_mapping: Mapping | None
+
+
+@dataclass(frozen=True, slots=True)
 class NATConfig:
     """NAT 实例配置（构造后不可变）。
 

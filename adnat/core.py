@@ -13,6 +13,10 @@
 全部可满足才一次性提交；容量不足抛 PortExhaustionError（全池扫描，
 证明无解）或 SearchBudgetExhaustedError（预算耗尽，未证明无解），
 此时 NAT 状态与调用前完全一致——不存在部分分配。
+
+``translate_hairpin`` 同样把目的查找、源映射容量规划与双方超时刷新
+合成一次提交：任何一步失败（含源端口池耗尽 / 搜索预算耗尽）都在
+状态变更之前抛出或丢弃，目的映射的计时与端口状态均不变化。
 """
 
 from __future__ import annotations
@@ -32,6 +36,7 @@ from .model import (
     AllocationResult,
     DropReason,
     Endpoint,
+    HairpinResult,
     Mapping,
     NATConfig,
     Packet,
@@ -304,6 +309,108 @@ class AddressDependentNAT:
         rec.expires_at = now + self._config.lifetime
         rewritten = udp_five_tuple(packet.src, rec.internal)
         return TranslationResult(True, rewritten, None, rec.snapshot(key))
+
+    # ------------------------------------------------------------------ #
+    # Hairpin（内网折返）                                                  #
+    # ------------------------------------------------------------------ #
+
+    def translate_hairpin(self, packet: Packet, *, at: int | None = None
+                          ) -> HairpinResult:
+        """Hairpin 入口：内网源访问自己的公网端点时折返回内网。
+
+        当 ``packet.dst == (公网IP, 某条仍有效映射的外端口)`` 且包来自
+        内网侧时：
+
+        1. **目的改写**：目的映射（按外端口命中，必须属于当前公网地址且
+           未过期）的内网端点成为新目的。这是入站"源必须等于记录对端"
+           过滤的**唯一明确例外**——该例外只在本入口生效，
+           ``translate_inbound`` 的普通入站过滤不被放宽。
+        2. **源分配**：为源按原出站规则取得映射
+           key=(源IP,源端口,公网IP,目的外端口)：已存在活跃映射则复用
+           （不重复扣容量），否则按"最小空闲端口 + 隔离"规则新建。
+           自己访问自己拥有的映射同样允许，且只占用源这一份容量。
+        3. **一次提交**：目的查找、源端口规划、双方超时刷新合并为一次
+           提交。源端口池耗尽 / 搜索预算耗尽在任何计时更新之前抛出，
+           目的映射的 last_seen/expires_at 不发生变化。
+
+        generation 语义：``generation=0`` 不参与校验（既有约定）；非零时
+        必须等于**目的映射**的 generation，否则按 STALE_GENERATION 丢弃。
+        包在逻辑上到达的是目的映射的公网端点，包上的代号守护这条被命中
+        的映射（与入站同侧）；源映射是本次按出站规则取得的本地分配，其
+        generation 只随结果返回，不要求与包号相等——源、目的是两条不同
+        映射，全局单调计数使两者 generation 必然不同，单个包号不可能
+        同时等于双方。
+
+        成功返回的五元组为
+        ``(公网IP, 源映射外端口) -> 目的映射.内网端点``，
+        结果中携带源、目的两条映射快照（含双方 generation）。
+        """
+        now = self._resolve_at(at)
+        self._validate_packet(packet)
+        self._check_clock(now)
+        # 与其他 translate 入口一致：先按当前时钟回收过期映射。
+        self._housekeeping(now)
+
+        # ---- 目的查找：必须属于当前公网地址且外端口仍有活映射 ----
+        if packet.dst.ip != self._config.public_ip:
+            return HairpinResult(
+                False, None, DropReason.DEST_MISMATCH, None, None, False)
+        source_key = self._hairpin_source_key(packet)
+        rec_s = self._mappings.get(source_key)
+        dest_key = self._port_to_key.get(packet.dst.port)
+        if dest_key is None:
+            return HairpinResult(
+                False, None, DropReason.NO_MAPPING,
+                rec_s.snapshot(source_key) if rec_s is not None else None,
+                None, False)
+        rec_d = self._mappings[dest_key]
+
+        # ---- generation 校验（任何状态变更之前；丢弃不改计时） ----
+        # 包号只守护被命中的目的映射；源映射的 generation 随结果返回。
+        if packet.generation != 0 and packet.generation != rec_d.generation:
+            return HairpinResult(
+                False, None, DropReason.STALE_GENERATION,
+                rec_s.snapshot(source_key) if rec_s is not None else None,
+                rec_d.snapshot(dest_key), False)
+
+        # ---- 源端口规划（纯函数）：耗尽/预算耗尽在此抛出，双方计时均未动 ----
+        self._check_expiry_overflow(now)
+        planned_ports = self._plan_ports(1, now) if rec_s is None else []
+
+        # ---- 一次提交：源分配（或复用）+ 双方超时刷新 ----
+        created = False
+        if rec_s is None:
+            port = planned_ports[0]
+            rec_s = _Record(
+                internal=packet.src,
+                remote=Endpoint(self._config.public_ip, packet.dst.port),
+                external_port=port,
+                generation=self._next_generation,
+                created_at=now,
+                last_seen=now,
+                expires_at=now + self._config.lifetime,
+            )
+            self._next_generation += 1
+            self._mappings[source_key] = rec_s
+            self._port_to_key[port] = source_key
+            created = True
+        else:
+            rec_s.last_seen = now
+            rec_s.expires_at = now + self._config.lifetime
+        rec_d.last_seen = now
+        rec_d.expires_at = now + self._config.lifetime
+
+        rewritten = udp_five_tuple(
+            Endpoint(self._config.public_ip, rec_s.external_port),
+            rec_d.internal)
+        return HairpinResult(
+            True, rewritten, None,
+            rec_s.snapshot(source_key), rec_d.snapshot(dest_key), created)
+
+    @staticmethod
+    def _hairpin_source_key(packet: Packet) -> Key:
+        return (packet.src.ip, packet.src.port,
+                packet.dst.ip, packet.dst.port)
 
     # ------------------------------------------------------------------ #
     # 生命周期                                                            #

@@ -163,6 +163,30 @@ class TranslationResult:
 
 
 @dataclass(frozen=True, slots=True)
+class HairpinResult:
+    """Hairpin（内网折返）改写结果。
+
+    内网源访问 ``(公网IP, 仍有效映射的外端口)`` 时：
+    目的改写为该映射（``destination_mapping``）的内网端点；源按原出站
+    规则取得自己的出站映射（``source_mapping``）。双方 generation 分别
+    取自两个映射快照。
+
+    - accepted=True：rewritten 为折回后的五元组
+      ``(公网IP, 源映射外端口) -> 目的映射.内网端点``；
+      source_created 标记源映射是本次新建（True）还是复用（False）。
+    - accepted=False：reason 为 DEST_MISMATCH / NO_MAPPING /
+      STALE_GENERATION 之一；mapping 字段在可定位时附上当前快照。
+    """
+
+    accepted: bool
+    rewritten: FiveTuple | None
+    reason: DropReason | None
+    source_mapping: Mapping | None
+    destination_mapping: Mapping | None
+    source_created: bool
+
+
+@dataclass(frozen=True, slots=True)
 class NATConfig:
     """NAT 实例配置（构造后不可变）。
 

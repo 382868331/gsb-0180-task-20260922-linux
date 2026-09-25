@@ -19,6 +19,7 @@ from .model import (
     DropReason,
     Endpoint,
     FiveTuple,
+    HairpinResult,
     Mapping,
     NATConfig,
     Packet,
@@ -38,6 +39,7 @@ __all__ = [
     "AllocationRequest",
     "AllocationResult",
     "TranslationResult",
+    "HairpinResult",
     "DropReason",
     "NATConfig",
     "MAX_TIME",
@@ -45,4 +47,4 @@ __all__ = [
     "MAX_POOL_SIZE",
 ]
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"

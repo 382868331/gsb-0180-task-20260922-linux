@@ -12,16 +12,24 @@ from .errors import (
 )
 from .model import (
     MAX_BATCH_REQUESTS,
+    MAX_DATAGRAM_ID,
+    MAX_DATAGRAM_SIZE,
     MAX_POOL_SIZE,
     MAX_TIME,
     AllocationRequest,
     AllocationResult,
+    Direction,
     DropReason,
     Endpoint,
     FiveTuple,
+    Fragment,
+    FragmentGroupView,
+    FragmentResult,
+    FragmentStatus,
     Mapping,
     NATConfig,
     Packet,
+    RewrittenFragment,
     TranslationResult,
 )
 
@@ -34,6 +42,12 @@ __all__ = [
     "Endpoint",
     "FiveTuple",
     "Packet",
+    "Direction",
+    "Fragment",
+    "FragmentGroupView",
+    "FragmentResult",
+    "FragmentStatus",
+    "RewrittenFragment",
     "Mapping",
     "AllocationRequest",
     "AllocationResult",
@@ -43,6 +57,8 @@ __all__ = [
     "MAX_TIME",
     "MAX_BATCH_REQUESTS",
     "MAX_POOL_SIZE",
+    "MAX_DATAGRAM_ID",
+    "MAX_DATAGRAM_SIZE",
 ]
 
 __version__ = "1.0.0"

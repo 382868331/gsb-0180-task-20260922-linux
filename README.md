@@ -12,7 +12,19 @@
 ```bash
 python -m unittest discover -s tests -v   # 必要测试（契约 + 差分）
 python demo.py                            # 固定输入演示，秒级完成
+python demo_iteration.py                  # 分片入口演示（本轮新增），秒级完成
 ```
+
+## venv 准备
+
+无需任何第三方依赖；任选其一：
+
+```bash
+python3.14 -m venv .venv && . .venv/bin/activate   # 可选
+python -m unittest discover -s tests -v
+```
+
+直接用系统 Python 3.14.7 运行上述命令亦可。
 
 ## 模型与契约
 
@@ -77,6 +89,45 @@ nat.now -> int
 （UDP，protocol=17）；否则 `reason` 为 `DropReason` 之一：
 `NO_MAPPING` / `STALE_GENERATION` / `PEER_MISMATCH` / `DEST_MISMATCH`。
 
+## 分片入口（本轮新增）
+
+在既有实现上新增 IP 分片处理入口，与非分片入口并存、互不改行为：
+
+```python
+from adnat import (
+    Direction, Fragment, FragmentResult, FragmentStatus,
+    RewrittenFragment, FragmentGroupView,
+)
+
+nat.process_fragment(fragment: Fragment, *, at: int | None = None)
+    -> FragmentResult
+nat.fragment_groups() -> list[FragmentGroupView]   # 暂存中分片组快照
+```
+
+- **关联 key** = `(direction, src_ip, dst_ip, protocol, datagram_id)`；
+  同一数据报的全部分片凭此五元关联，protocol 仅支持 17（UDP）。
+- **首片**（`offset == 0`）含 UDP 端口（`src_port`/`dst_port` 必填）：
+  出站方向建立或复用映射（分片路径允许隐式建映射），入站方向按
+  外端口命中既有映射；随后改写本片与全部暂存片的地址。
+- **非首片**（`offset > 0`，端口必须为 0）先到时只能暂存
+  （`BUFFERED`），**不**凭 `datagram_id` 猜任何连接、不建映射。
+- **冻结世代**：首片到达时冻结映射的 `generation`，后续片一律按该
+  世代改写；映射过期/释放/重建导致世代不一致时，旧组迟到片整组
+  拒绝（`STALE_GENERATION`），避免 ID 复用串包。
+- **重叠与重复**：重叠区字节不一致整组拒绝（`OVERLAP_CONFLICT`）；
+  完全重复片幂等（`DUPLICATE`，无状态变更）；重叠但字节一致可接受。
+- **上限**（`NATConfig` 新增字段，均有默认值）：
+  `max_datagram_size`（重组总长度，默认 65535）、`max_fragments`
+  （单组片数，默认 64）、`max_cached_bytes`（全局缓存字节，默认
+  262144）、`fragment_timeout`（逻辑超时，默认 30；
+  `now >= last_seen + fragment_timeout` 整组释放）。触限即整组拒绝
+  （`DATAGRAM_TOO_LARGE` / `TOO_MANY_FRAGMENTS` / `CACHE_FULL`）。
+- **释放**：数据报到齐（`COMPLETE`）、整组拒绝（`DROPPED`）或逻辑
+  超时后释放关联与缓存，`datagram_id` 可安全复用。
+- `FragmentResult.status` ∈ `BUFFERED / DUPLICATE / FORWARDED /
+  COMPLETE / DROPPED`；`rewritten` 为本次吐出的 `RewrittenFragment`
+  （五元组 + offset/MF/原载荷字节，载荷不改动）。
+
 ## 错误语义
 
 所有异常继承 `NATError`：
@@ -101,6 +152,8 @@ IPv4 只接受规范点分十进制（无前导零）。错误消息均带字段
 | 单批分配请求数 | `MAX_BATCH_REQUESTS` = 65535，且批内 key 不重复 |
 | 时间类整数（`at`/`advance`/`lifetime`/`quarantine` 等） | 0..2^63-1（`MAX_TIME`），且 `now + lifetime` 不得溢出 |
 | `generation` | 0..2^63-1 |
+| 数据报 ID / 分片偏移 | 0..65535（`MAX_DATAGRAM_ID` / `MAX_DATAGRAM_SIZE`） |
+| 分片重组 | 总长 `max_datagram_size`、片数 `max_fragments`、缓存 `max_cached_bytes`、超时 `fragment_timeout` |
 
 ## 精度说明（误差口径）
 
@@ -126,7 +179,9 @@ generation 比较）均为精确整数运算，比较采用严格不等式
 ## 已知限制
 
 - 仅 UDP（protocol 固定 17）；仅地址依赖映射 + 地址依赖过滤，不含
-  端口依赖/锥形 NAT、hairpin、ALG、分片、ICMP 等行为。
+  端口依赖/锥形 NAT、hairpin、ALG、ICMP 等行为。分片仅按上文
+  `分片入口（本轮新增）` 一节的合成契约处理：不强制 8 字节
+  对齐，不处理真实抓包。
 - 单实例、单线程；状态只在内存中，无持久化。
 - 端口分配为"最小空闲"策略的线性扫描，复杂度 O(池大小)；
   本题上限（65535）下足够。
@@ -145,6 +200,8 @@ adnat/            本题库（可导入）
 tests/
   test_contract.py      契约测试（手工期望值）
   test_differential.py  差分测试（核心 vs 独立字典参考）
+  test_fragments.py     分片入口测试（乱序/超时/换代/重叠/上限/独立重组）
   reference_nat.py      独立字典参考实现（测试 oracle）
 demo.py           固定输入演示
+demo_iteration.py 分片入口演示（本轮新增）
 ```

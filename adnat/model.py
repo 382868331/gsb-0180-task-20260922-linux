@@ -18,8 +18,21 @@ MAX_TIME = 2**63 - 1
 MAX_BATCH_REQUESTS = 65535
 #: 端口池容量上限（端口空间本身只有 65535 个可用端口）。
 MAX_POOL_SIZE = 65535
+#: IP 数据报 ID 与分片偏移/总长度的上限（16 位 ID 空间、65535 字节载荷）。
+MAX_DATAGRAM_ID = 65535
+MAX_DATAGRAM_SIZE = 65535
 
 _PROTOCOL_UDP = 17
+
+
+class Direction(enum.Enum):
+    """分片数据报的方向。"""
+
+    OUTBOUND = "outbound"
+    """内网 -> 公网。"""
+
+    INBOUND = "inbound"
+    """公网 -> 内网。"""
 
 
 class DropReason(enum.Enum):
@@ -36,6 +49,18 @@ class DropReason(enum.Enum):
 
     DEST_MISMATCH = "dest_mismatch"
     """入站包目的地址不是本 NAT 的固定公网 IP。"""
+
+    OVERLAP_CONFLICT = "overlap_conflict"
+    """同组分片重叠且重叠区字节不一致：整组拒绝。"""
+
+    DATAGRAM_TOO_LARGE = "datagram_too_large"
+    """重组后总长度超过 max_datagram_size：整组拒绝。"""
+
+    TOO_MANY_FRAGMENTS = "too_many_fragments"
+    """单组分片数超过 max_fragments：整组拒绝。"""
+
+    CACHE_FULL = "cache_full"
+    """全局分片缓存字节达到 max_cached_bytes：整组拒绝。"""
 
 
 @dataclass(frozen=True, slots=True)
@@ -178,6 +203,14 @@ class NATConfig:
     lifetime: int = 300
     quarantine: int = 60
     search_budget: int | None = None
+    fragment_timeout: int = 30
+    """分片组的逻辑超时：now >= last_seen + fragment_timeout 时整组释放。"""
+    max_datagram_size: int = MAX_DATAGRAM_SIZE
+    """单个数据报重组后总长度上限（字节）。"""
+    max_fragments: int = 64
+    """单个数据报允许缓存的分片数上限。"""
+    max_cached_bytes: int = 262144
+    """全实例分片缓存字节上限（各组已存载荷长度之和）。"""
 
     def __post_init__(self) -> None:
         check_ipv4(self.public_ip, "NATConfig.public_ip")
@@ -208,6 +241,14 @@ class NATConfig:
         else:
             check_int(self.search_budget, "NATConfig.search_budget",
                       minimum=1, maximum=MAX_TIME)
+        check_int(self.fragment_timeout, "NATConfig.fragment_timeout",
+                  minimum=1, maximum=MAX_TIME)
+        check_int(self.max_datagram_size, "NATConfig.max_datagram_size",
+                  minimum=1, maximum=MAX_DATAGRAM_SIZE)
+        check_int(self.max_fragments, "NATConfig.max_fragments",
+                  minimum=1, maximum=MAX_DATAGRAM_SIZE)
+        check_int(self.max_cached_bytes, "NATConfig.max_cached_bytes",
+                  minimum=1, maximum=MAX_TIME)
 
 
 def udp_five_tuple(src: Endpoint, dst: Endpoint) -> FiveTuple:
@@ -217,3 +258,124 @@ def udp_five_tuple(src: Endpoint, dst: Endpoint) -> FiveTuple:
         src_ip=src.ip, src_port=src.port,
         dst_ip=dst.ip, dst_port=dst.port,
     )
+
+
+@dataclass(frozen=True, slots=True)
+class Fragment:
+    """一个 IP 分片（合成，非真实抓包）。
+
+    同一数据报的分片由 (direction, src_ip, dst_ip, protocol, datagram_id)
+    关联。首片（offset == 0）含 UDP 端口，可据此建立/查找映射；
+    非首片（offset > 0）没有端口，src_port/dst_port 必须为 0，
+    只能暂存，不能凭 datagram_id 猜任何连接。
+
+    offset 为载荷在原始数据报中的字节偏移（本库不强制 8 字节对齐）。
+    """
+
+    direction: Direction
+    src_ip: str
+    dst_ip: str
+    protocol: int
+    datagram_id: int
+    offset: int
+    more_fragments: bool
+    payload: bytes
+    src_port: int = 0
+    dst_port: int = 0
+    generation: int = 0
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.direction, Direction):
+            raise ValidationError(
+                f"Fragment.direction must be Direction, "
+                f"got {type(self.direction).__name__}"
+            )
+        check_ipv4(self.src_ip, "Fragment.src_ip")
+        check_ipv4(self.dst_ip, "Fragment.dst_ip")
+        check_int(self.protocol, "Fragment.protocol", minimum=0, maximum=255)
+        if self.protocol != _PROTOCOL_UDP:
+            raise ValidationError(
+                f"Fragment.protocol must be 17 (UDP), got {self.protocol}"
+            )
+        check_int(self.datagram_id, "Fragment.datagram_id",
+                  minimum=0, maximum=MAX_DATAGRAM_ID)
+        check_int(self.offset, "Fragment.offset",
+                  minimum=0, maximum=MAX_DATAGRAM_SIZE)
+        if not isinstance(self.more_fragments, bool):
+            raise ValidationError(
+                f"Fragment.more_fragments must be bool, "
+                f"got {type(self.more_fragments).__name__}"
+            )
+        if not isinstance(self.payload, (bytes, bytearray)):
+            raise ValidationError(
+                f"Fragment.payload must be bytes, "
+                f"got {type(self.payload).__name__}"
+            )
+        if len(self.payload) == 0:
+            raise ValidationError("Fragment.payload must be non-empty")
+        check_int(self.generation, "Fragment.generation",
+                  minimum=0, maximum=MAX_TIME)
+        if self.offset == 0:
+            check_port(self.src_port, "Fragment.src_port (first fragment)")
+            check_port(self.dst_port, "Fragment.dst_port (first fragment)")
+        else:
+            check_int(self.src_port, "Fragment.src_port (non-first)",
+                      minimum=0, maximum=0)
+            check_int(self.dst_port, "Fragment.dst_port (non-first)",
+                      minimum=0, maximum=0)
+
+    @property
+    def end(self) -> int:
+        """本片覆盖区间的开右端（字节）。"""
+        return self.offset + len(self.payload)
+
+
+@dataclass(frozen=True, slots=True)
+class RewrittenFragment:
+    """改写后的分片：五元组 + 原样保留的分片元信息与原载荷字节。"""
+
+    five_tuple: FiveTuple
+    datagram_id: int
+    offset: int
+    more_fragments: bool
+    payload: bytes
+
+
+class FragmentStatus(enum.Enum):
+    """process_fragment 的处理结果状态。"""
+
+    BUFFERED = "buffered"
+    """非首片先到，已暂存，等待首片。"""
+
+    DUPLICATE = "duplicate"
+    """完全重复片：幂等接受，无任何状态变更。"""
+
+    FORWARDED = "forwarded"
+    """本片（及可能连带暂存片）已按冻结映射改写发出，数据报尚未齐。"""
+
+    COMPLETE = "complete"
+    """数据报全部到齐，本次吐出剩余改写片，关联已释放。"""
+
+    DROPPED = "dropped"
+    """整组拒绝并释放关联；reason 给出原因。"""
+
+
+@dataclass(frozen=True, slots=True)
+class FragmentResult:
+    """分片处理结果。rewritten 为本次调用吐出的改写分片（可为空）。"""
+
+    status: FragmentStatus
+    rewritten: tuple[RewrittenFragment, ...]
+    reason: DropReason | None
+
+
+@dataclass(frozen=True, slots=True)
+class FragmentGroupView:
+    """一个暂存中分片组的只读快照。"""
+
+    key: tuple[str, str, str, int, int]
+    """(direction, src_ip, dst_ip, protocol, datagram_id)。"""
+    buffered_bytes: int
+    fragment_count: int
+    have_first: bool
+    last_seen: int

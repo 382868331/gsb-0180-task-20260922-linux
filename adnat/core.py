@@ -30,16 +30,23 @@ from .model import (
     MAX_TIME,
     AllocationRequest,
     AllocationResult,
+    Direction,
     DropReason,
     Endpoint,
+    Fragment,
+    FragmentGroupView,
+    FragmentResult,
+    FragmentStatus,
     Mapping,
     NATConfig,
     Packet,
+    RewrittenFragment,
     TranslationResult,
     udp_five_tuple,
 )
 
 Key = tuple[str, int, str, int]
+FragKey = tuple[str, str, str, int, int]
 
 
 @dataclass(slots=True)
@@ -67,6 +74,43 @@ class _Record:
         )
 
 
+@dataclass(slots=True)
+class _FragGroup:
+    """一个分片数据报的重组状态（内部可变）。
+
+    frags: offset -> payload（已暂存的分片，含首片到达前与之后）。
+    首片到达后冻结映射世代（generation/map_key/rewrite 端点），
+    后续片一律按冻结世代改写；映射换代即整组拒绝。
+    """
+
+    created_at: int
+    last_seen: int
+    frags: dict[int, bytes]
+    mf: dict[int, bool]
+    buffered_bytes: int
+    final_end: int | None = None
+    have_first: bool = False
+    map_key: Key | None = None
+    generation: int = 0
+    rewrite_src: Endpoint | None = None
+    rewrite_dst: Endpoint | None = None
+
+    def is_complete(self) -> bool:
+        """final_end 已知且 [0, final_end) 被分片区间完全覆盖。"""
+        if self.final_end is None or not self.have_first:
+            return False
+        covered = 0
+        for start, end in sorted(
+            (off, off + len(pl)) for off, pl in self.frags.items()
+        ):
+            if start > covered:
+                return False
+            covered = max(covered, end)
+            if covered >= self.final_end:
+                return True
+        return False
+
+
 class AddressDependentNAT:
     """地址依赖（address-dependent）映射与过滤的 UDP NAT 模拟器。
 
@@ -90,6 +134,8 @@ class AddressDependentNAT:
         # 隔离中的端口：port -> 释放时刻（进入隔离的时刻）。
         self._quarantine: dict[int, int] = {}
         self._next_generation = 1
+        self._frag_groups: dict[FragKey, _FragGroup] = {}
+        self._frag_cached_bytes = 0
 
     # ------------------------------------------------------------------ #
     # 只读属性                                                            #
@@ -129,8 +175,22 @@ class AddressDependentNAT:
                   if now >= t + self._config.quarantine]
         for p in q_done:
             del self._quarantine[p]
+        self._expire_frag_groups(now)
         self._now = now
         return expired
+
+    def _expire_frag_groups(self, now: int) -> None:
+        """释放逻辑超时的分片组（now >= last_seen + fragment_timeout）。"""
+        timeout = self._config.fragment_timeout
+        dead = [k for k, g in self._frag_groups.items()
+                if now >= g.last_seen + timeout]
+        for k in dead:
+            self._drop_frag_group(k)
+
+    def _drop_frag_group(self, key: FragKey) -> None:
+        group = self._frag_groups.pop(key, None)
+        if group is not None:
+            self._frag_cached_bytes -= group.buffered_bytes
 
     def _plan_ports(self, count: int, now: int) -> list[int]:
         """纯函数：为 count 个新映射规划最小空闲端口（不修改状态）。
@@ -309,6 +369,204 @@ class AddressDependentNAT:
     # 生命周期                                                            #
     # ------------------------------------------------------------------ #
 
+    # ------------------------------------------------------------------ #
+    # 分片重组                                                            #
+    # ------------------------------------------------------------------ #
+
+    def process_fragment(self, fragment: Fragment, *, at: int | None = None
+                         ) -> FragmentResult:
+        """处理一个 IP 分片。
+
+        同一数据报由 (direction, src_ip, dst_ip, protocol, datagram_id)
+        关联。首片（offset=0，含 UDP 端口）到达时建立/复用映射并冻结其
+        世代，随后改写本片与全部暂存片；非首片先到只能暂存。重叠区字节
+        不一致整组拒绝；完全重复片幂等。数据报到齐、拒绝或逻辑超时后
+        释放关联，datagram_id 可安全复用。
+        """
+        now = self._resolve_at(at)
+        if not isinstance(fragment, Fragment):
+            raise ValidationError(
+                f"fragment must be Fragment, got {type(fragment).__name__}"
+            )
+        self._check_clock(now)
+        self._check_expiry_overflow(now)
+        self._housekeeping(now)
+        fkey: FragKey = (fragment.direction.value, fragment.src_ip,
+                         fragment.dst_ip, fragment.protocol,
+                         fragment.datagram_id)
+        group = self._frag_groups.get(fkey)
+        if group is None:
+            group = _FragGroup(created_at=now, last_seen=now,
+                               frags={}, mf={}, buffered_bytes=0)
+            self._frag_groups[fkey] = group
+        group.last_seen = now
+
+        # 冻结世代校验：首片已建立关联后，映射换代（过期/释放/重建）
+        # 即整组拒绝，防止 ID 复用串包。
+        if group.have_first:
+            rec = self._mappings.get(group.map_key)
+            if rec is None or rec.generation != group.generation:
+                self._drop_frag_group(fkey)
+                return FragmentResult(FragmentStatus.DROPPED, (),
+                                      DropReason.STALE_GENERATION)
+
+        # 完全重复片：幂等，无任何状态变更。
+        if (group.frags.get(fragment.offset) == fragment.payload
+                and fragment.offset in group.frags):
+            return FragmentResult(FragmentStatus.DUPLICATE, (), None)
+
+        # 重叠区字节一致性：不一致整组拒绝。
+        end = fragment.end
+        for off, pl in group.frags.items():
+            lo = max(off, fragment.offset)
+            hi = min(off + len(pl), end)
+            if lo < hi and pl[lo - off:hi - off] != fragment.payload[
+                    lo - fragment.offset:hi - fragment.offset]:
+                self._drop_frag_group(fkey)
+                return FragmentResult(FragmentStatus.DROPPED, (),
+                                      DropReason.OVERLAP_CONFLICT)
+
+        # 总长度一致性：MF=0 片确定 final_end，冲突即拒绝。
+        if not fragment.more_fragments:
+            if group.final_end is not None and group.final_end != end:
+                self._drop_frag_group(fkey)
+                return FragmentResult(FragmentStatus.DROPPED, (),
+                                      DropReason.OVERLAP_CONFLICT)
+            if any(off + len(pl) > end for off, pl in group.frags.items()):
+                self._drop_frag_group(fkey)
+                return FragmentResult(FragmentStatus.DROPPED, (),
+                                      DropReason.OVERLAP_CONFLICT)
+        if group.final_end is not None and end > group.final_end:
+            self._drop_frag_group(fkey)
+            return FragmentResult(FragmentStatus.DROPPED, (),
+                                  DropReason.OVERLAP_CONFLICT)
+
+        # 上限：总长度 / 片数 / 全局缓存字节。
+        if end > self._config.max_datagram_size:
+            self._drop_frag_group(fkey)
+            return FragmentResult(FragmentStatus.DROPPED, (),
+                                  DropReason.DATAGRAM_TOO_LARGE)
+        if len(group.frags) + 1 > self._config.max_fragments:
+            self._drop_frag_group(fkey)
+            return FragmentResult(FragmentStatus.DROPPED, (),
+                                  DropReason.TOO_MANY_FRAGMENTS)
+        if (self._frag_cached_bytes + len(fragment.payload)
+                > self._config.max_cached_bytes):
+            self._drop_frag_group(fkey)
+            return FragmentResult(FragmentStatus.DROPPED, (),
+                                  DropReason.CACHE_FULL)
+
+        # 首片：建立/复用映射并冻结世代；失败（含端口耗尽异常）整组释放。
+        if not group.have_first and fragment.offset == 0:
+            try:
+                result = self._bind_first_fragment(group, fragment, now)
+            except Exception:
+                self._drop_frag_group(fkey)
+                raise
+            if result is not None:
+                self._drop_frag_group(fkey)
+                return result
+
+        # 提交本片。
+        group.frags[fragment.offset] = fragment.payload
+        group.mf[fragment.offset] = fragment.more_fragments
+        group.buffered_bytes += len(fragment.payload)
+        self._frag_cached_bytes += len(fragment.payload)
+        if not fragment.more_fragments:
+            group.final_end = end
+
+        if not group.have_first:
+            # 非首片先到：只能暂存，不能凭 datagram_id 猜连接。
+            return FragmentResult(FragmentStatus.BUFFERED, (), None)
+
+        # 首片已到：改写发出。首片本次到达时连带吐出全部暂存片。
+        rec = self._mappings[group.map_key]
+        rec.last_seen = now
+        rec.expires_at = now + self._config.lifetime
+        offsets = (sorted(group.frags) if fragment.offset == 0
+                   else [fragment.offset])
+        emitted = tuple(self._rewrite(group, fkey[4], off) for off in offsets)
+        if group.is_complete():
+            self._drop_frag_group(fkey)
+            return FragmentResult(FragmentStatus.COMPLETE, emitted, None)
+        return FragmentResult(FragmentStatus.FORWARDED, emitted, None)
+
+    def _bind_first_fragment(self, group: _FragGroup, fragment: Fragment,
+                             now: int) -> FragmentResult | None:
+        """首片到达：建立/查找映射并冻结世代。返回 None 表示成功。"""
+        cfg = self._config
+        if fragment.direction is Direction.OUTBOUND:
+            key: Key = (fragment.src_ip, fragment.src_port,
+                        fragment.dst_ip, fragment.dst_port)
+            rec = self._mappings.get(key)
+            if rec is None and fragment.generation != 0:
+                # 携带世代的包对着不存在的映射：迟到包，不隐式建映射。
+                return FragmentResult(FragmentStatus.DROPPED, (),
+                                      DropReason.STALE_GENERATION)
+            if rec is None:
+                port = self._plan_ports(1, now)[0]
+                rec = _Record(
+                    internal=Endpoint(fragment.src_ip, fragment.src_port),
+                    remote=Endpoint(fragment.dst_ip, fragment.dst_port),
+                    external_port=port,
+                    generation=self._next_generation,
+                    created_at=now,
+                    last_seen=now,
+                    expires_at=now + cfg.lifetime,
+                )
+                self._next_generation += 1
+                self._mappings[key] = rec
+                self._port_to_key[port] = key
+            if fragment.generation != 0 and fragment.generation != rec.generation:
+                return FragmentResult(FragmentStatus.DROPPED, (),
+                                      DropReason.STALE_GENERATION)
+            group.map_key = key
+            group.rewrite_src = Endpoint(cfg.public_ip, rec.external_port)
+            group.rewrite_dst = Endpoint(fragment.dst_ip, fragment.dst_port)
+        else:
+            if fragment.dst_ip != cfg.public_ip:
+                return FragmentResult(FragmentStatus.DROPPED, (),
+                                      DropReason.DEST_MISMATCH)
+            key = self._port_to_key.get(fragment.dst_port)
+            if key is None:
+                return FragmentResult(FragmentStatus.DROPPED, (),
+                                      DropReason.NO_MAPPING)
+            rec = self._mappings[key]
+            if fragment.generation != 0 and fragment.generation != rec.generation:
+                return FragmentResult(FragmentStatus.DROPPED, (),
+                                      DropReason.STALE_GENERATION)
+            group.map_key = key
+            group.rewrite_src = rec.remote
+            group.rewrite_dst = rec.internal
+        group.have_first = True
+        group.generation = rec.generation
+        return None
+
+    @staticmethod
+    def _rewrite(group: _FragGroup, datagram_id: int,
+                 offset: int) -> RewrittenFragment:
+        assert group.rewrite_src is not None and group.rewrite_dst is not None
+        return RewrittenFragment(
+            five_tuple=udp_five_tuple(group.rewrite_src, group.rewrite_dst),
+            datagram_id=datagram_id,
+            offset=offset,
+            more_fragments=group.mf[offset],
+            payload=group.frags[offset],
+        )
+
+    def fragment_groups(self) -> list[FragmentGroupView]:
+        """当前暂存中的分片组快照，按 key 排序（确定性输出）。"""
+        return [
+            FragmentGroupView(
+                key=key,
+                buffered_bytes=g.buffered_bytes,
+                fragment_count=len(g.frags),
+                have_first=g.have_first,
+                last_seen=g.last_seen,
+            )
+            for key, g in sorted(self._frag_groups.items())
+        ]
+
     def release(self, key: Key, *, at: int | None = None) -> bool:
         """显式释放一条映射；端口进入隔离。映射不存在返回 False（无变更）。"""
         now = self._resolve_at(at)
@@ -368,6 +626,8 @@ class AddressDependentNAT:
             "ports_quarantined": len(self._quarantine),
             "ports_free": pool - len(self._port_to_key) - len(self._quarantine),
             "pool_size": pool,
+            "fragment_groups": len(self._frag_groups),
+            "fragment_cached_bytes": self._frag_cached_bytes,
         }
 
     # ------------------------------------------------------------------ #

@@ -14,6 +14,20 @@ python -m unittest discover -s tests -v   # 必要测试（契约 + 差分）
 python demo.py                            # 固定输入演示，秒级完成
 ```
 
+```bash
+python demo_iteration.py                   # 本轮新增：差错报文入口演示
+```
+
+### venv 准备（可选）
+
+```bash
+python3.14 -m venv .venv        # 任意 Python 3.14.7 解释器
+. .venv/bin/activate
+```
+
+无第三方依赖，`requirements.txt` 为空占位；不激活 venv 直接用系统
+Python 3.14.7 亦可。
+
 ## 模型与契约
 
 - **出站 key** = `(内网IP, 内网端口, 目的IP, 目的端口)`。同一内网端点访问
@@ -43,7 +57,7 @@ python demo.py                            # 固定输入演示，秒级完成
 from adnat import (
     AddressDependentNAT, NATConfig, Endpoint, Packet,
     AllocationRequest, AllocationResult, TranslationResult,
-    Mapping, FiveTuple, DropReason,
+    Mapping, FiveTuple, DropReason, ErrorReport, ErrorResult,
     NATError, ValidationError, PortExhaustionError,
     SearchBudgetExhaustedError,
 )
@@ -66,6 +80,8 @@ nat.translate_inbound(packet: Packet, *, at: int | None = None)
     -> TranslationResult
 nat.release(key: tuple, *, at: int | None = None) -> bool   # 不存在返回 False
 nat.advance(seconds: int) -> list[key]                      # 返回本次过期的 key
+nat.translate_error(report: ErrorReport, *, at: int | None = None)
+    -> ErrorResult                          # 差错报文反查（见下节）
 nat.get_mapping(key) -> Mapping | None
 nat.snapshot_mappings() -> list[Mapping]
 nat.quarantined_ports() -> dict[int, int]
@@ -76,6 +92,41 @@ nat.now -> int
 `TranslationResult.accepted=True` 时 `rewritten` 为改写后的 `FiveTuple`
 （UDP，protocol=17）；否则 `reason` 为 `DropReason` 之一：
 `NO_MAPPING` / `STALE_GENERATION` / `PEER_MISMATCH` / `DEST_MISMATCH`。
+
+## 差错报文入口（translate_error）
+
+合成差错报文（题内固定结构，**不是**真实 ICMP/协议栈，不发包）：输入外层
+源端点与被引用的原 UDP 五元组，按反向映射找回内部端点。
+
+```python
+from adnat import ErrorReport, ErrorResult
+
+report = ErrorReport(
+    outer_src=Endpoint("192.0.2.254", 1),   # 外层差错报文的源端点
+    quoted=FiveTuple(17, "203.0.113.7", 6100, "198.51.100.10", 53),
+    generation=1,   # 创建映射时 AllocationResult.mapping.generation 返回的世代标记
+)
+res = nat.translate_error(report)
+```
+
+约定：
+
+- `quoted` 必须是 NAT 改写后的**出站**五元组：`src=(公网IP, 外端口)`、
+  `dst=映射记录的远端`、`protocol=17`。引用必须与**仍有效**映射的公网
+  端点、远端及协议全部匹配。
+- `generation` 非 0 时必须等于映射当前世代标记，用于排除端口复用后的
+  旧引用；为 0 表示不携带世代信息。仅有现实五元组时，无法排除完全相同
+  元组的复用——本库**不承诺**识别这种情况（此时按当前映射命中）。
+- 差错报文**不创建新映射、不延长寿命**（`last_seen`/`expires_at` 不变），
+  重复差错不会污染状态；只有正常流量保活。
+- `ErrorResult.accepted=True` 时：`outer_dst` 为改写后的外层目标（内部
+  端点），`rewritten` 为发往内网的外层五元组，`quoted` 回显引用元组，
+  `mapping_id` 为采用的映射 ID（等于该映射的世代标记，全局唯一不重用）。
+- 丢弃原因（`DropReason` 新增）：`BAD_STRUCTURE`（非 UDP 或引用源不是
+  NAT 公网端点，结构不完整）、`NO_MAPPING`（外端口无有效映射）、
+  `STALE_GENERATION`（世代标记不符的旧引用）、`PEER_MISMATCH`（引用
+  远端与映射记录不符）、`AMBIGUOUS_REFERENCE`（引用命中多条有效映射，
+  无法唯一定位；当前实现同端口至多一条活跃映射，此分支为防御性保留）。
 
 ## 错误语义
 
@@ -127,6 +178,10 @@ generation 比较）均为精确整数运算，比较采用严格不等式
 
 - 仅 UDP（protocol 固定 17）；仅地址依赖映射 + 地址依赖过滤，不含
   端口依赖/锥形 NAT、hairpin、ALG、分片、ICMP 等行为。
+- 差错报文入口只处理题内给定的合成结构（外层源端点 + 被引用的原 UDP
+  五元组 + 世代标记），不实现真实 ICMP 解析、不构造真实差错报文、
+  不发包。不携带世代标记（generation=0）时，无法区分完全相同五元组
+  的端口复用，旧引用会被当作当前连接的引用处理。
 - 单实例、单线程；状态只在内存中，无持久化。
 - 端口分配为"最小空闲"策略的线性扫描，复杂度 O(池大小)；
   本题上限（65535）下足够。
@@ -145,6 +200,8 @@ adnat/            本题库（可导入）
 tests/
   test_contract.py      契约测试（手工期望值）
   test_differential.py  差分测试（核心 vs 独立字典参考）
+  test_error_report.py  差错报文入口契约测试 + 独立字典对照
   reference_nat.py      独立字典参考实现（测试 oracle）
 demo.py           固定输入演示
+demo_iteration.py 本轮新增：差错报文入口演示（正常 + 边界，秒级完成）
 ```

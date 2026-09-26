@@ -37,6 +37,12 @@ class DropReason(enum.Enum):
     DEST_MISMATCH = "dest_mismatch"
     """入站包目的地址不是本 NAT 的固定公网 IP。"""
 
+    BAD_STRUCTURE = "bad_structure"
+    """差错报文引用结构不完整/方向不符：非 UDP 或引用源不是 NAT 公网端点。"""
+
+    AMBIGUOUS_REFERENCE = "ambiguous_reference"
+    """引用命中多条有效映射，无法唯一定位原连接。"""
+
 
 @dataclass(frozen=True, slots=True)
 class Endpoint:
@@ -104,6 +110,9 @@ class Mapping:
     expires_at == now 时映射已过期（严格大于才存活）。
     """
 
+    mapping_id: int
+    """映射 ID：创建时分配的全局唯一序号（等于该映射的世代标记，不重用）。"""
+
     key: tuple[str, int, str, int]
     internal: Endpoint
     remote: Endpoint
@@ -158,6 +167,56 @@ class TranslationResult:
 
     accepted: bool
     rewritten: FiveTuple | None
+    reason: DropReason | None
+    mapping: Mapping | None
+
+
+@dataclass(frozen=True, slots=True)
+class ErrorReport:
+    """合成差错报文（题内固定结构，非真实 ICMP 协议栈）。
+
+    outer_src: 外层差错报文的源端点（报告差错的中间设备/主机）。
+    quoted:    被引用的原报文，必须是 NAT 改写后的**出站** UDP 五元组，
+               即 src=(公网IP, 外端口)、dst=映射记录的远端。
+    generation: 创建映射时返回的世代标记，用于排除端口复用后的旧引用；
+               0 表示不携带（无法排除完全相同五元组的复用）。
+    """
+
+    outer_src: Endpoint
+    quoted: FiveTuple
+    generation: int = 0
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.outer_src, Endpoint):
+            raise ValidationError(
+                f"ErrorReport.outer_src must be Endpoint, "
+                f"got {type(self.outer_src).__name__}"
+            )
+        if not isinstance(self.quoted, FiveTuple):
+            raise ValidationError(
+                f"ErrorReport.quoted must be FiveTuple, "
+                f"got {type(self.quoted).__name__}"
+            )
+        check_int(self.generation, "ErrorReport.generation",
+                  minimum=0, maximum=MAX_TIME)
+
+
+@dataclass(frozen=True, slots=True)
+class ErrorResult:
+    """差错报文反查结果。
+
+    accepted=True 时：outer_dst 为改写后的外层目标（内部端点），
+    rewritten 为发往内网的外层五元组 (outer_src -> 内部端点, UDP)，
+    quoted 回显引用元组，mapping_id 为采用的映射 ID。
+    accepted=False 时 reason 给出明确丢弃原因。
+    差错报文不创建映射、不刷新寿命。
+    """
+
+    accepted: bool
+    outer_dst: Endpoint | None
+    rewritten: FiveTuple | None
+    quoted: FiveTuple | None
+    mapping_id: int | None
     reason: DropReason | None
     mapping: Mapping | None
 

@@ -14,6 +14,8 @@ from adnat import (
     AddressDependentNAT,
     AllocationRequest,
     Endpoint,
+    ErrorReport,
+    FiveTuple,
     NATConfig,
     Packet,
     PortExhaustionError,
@@ -144,6 +146,25 @@ class TestDifferential(unittest.TestCase):
             self.assertEqual(c, r, f"release {key}")
             check_state()
 
+        def do_error(key, port, remote, gen):
+            report = ErrorReport(
+                outer_src=Endpoint("192.0.2.1", 1),
+                quoted=FiveTuple(17, PUB, port, remote.ip, remote.port),
+                generation=gen,
+            )
+            res = core.translate_error(report)
+            if res.accepted:
+                f = res.rewritten
+                core_res = ("ok", (f.protocol, f.src_ip, f.src_port,
+                                   f.dst_ip, f.dst_port), res.mapping_id)
+            else:
+                core_res = ("drop", res.reason.value, res.mapping_id)
+            ref_res = ref.error(("192.0.2.1", 1, 17, PUB, port,
+                                 remote.ip, remote.port, gen))
+            self.assertEqual(core_res, ref_res,
+                             f"error port={port} remote={remote} gen={gen}")
+            check_state()
+
         def do_advance(seconds):
             c = core.advance(seconds)
             r = ref.advance(seconds)
@@ -172,8 +193,16 @@ class TestDifferential(unittest.TestCase):
                 known = pair.known_gen.get(key, 0)
                 gen = rng.choice([0, known, known + 1])
                 do_inbound(src, port, gen)
-            elif roll < 0.92:                     # 释放
+            elif roll < 0.88:                     # 释放
                 do_release(rng.choice(KEYS))
+            elif roll < 0.96:                     # 差错报文反查
+                key = rng.choice(KEYS)
+                port = pair.known_port.get(key, rng.choice(PORTS))
+                remote = (Endpoint(key[2], key[3]) if rng.random() < 0.6
+                          else rng.choice(REMOTES))
+                known = pair.known_gen.get(key, 0)
+                gen = rng.choice([0, known, known + 1, 1])
+                do_error(key, port, remote, gen)
             else:                                 # 推进时钟
                 do_advance(rng.randint(0, 6))
 

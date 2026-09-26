@@ -204,6 +204,45 @@ class RefNAT:
         i_ip, i_pt = key[0], key[1]
         return ("ok", (17, s_ip, s_pt, i_ip, i_pt))
 
+    def error(self, rep, at=None):
+        """差错报文反查（独立字典实现）。
+
+        rep = (outer_src_ip, outer_src_port, proto, q_src_ip, q_src_port,
+               q_dst_ip, q_dst_port, generation)
+        -> ("ok", (17, os_ip, os_pt, inner_ip, inner_pt), mapping_id)
+           | ("drop", reason, mapping_id_or_None)
+        不修改任何状态（不刷新、不创建）。
+        """
+        now = self._resolve_at(at)
+        self._clock(now)
+        if (not isinstance(rep, tuple) or len(rep) != 8
+                or not _is_int(rep[1]) or not _is_int(rep[2])
+                or not _is_int(rep[4]) or not _is_int(rep[6])
+                or not _is_int(rep[7])
+                or not all(isinstance(rep[i], str) for i in (0, 3, 5))):
+            raise RefError("validation", f"bad error report {rep!r}")
+        os_ip, os_pt, proto, qs_ip, qs_pt, qd_ip, qd_pt, gen = rep
+        for v in (os_pt, qs_pt, qd_pt):
+            if not 1 <= v <= 65535:
+                raise RefError("validation", f"bad port in {rep!r}")
+        if gen < 0:
+            raise RefError("validation", f"bad generation {gen}")
+        self._housekeep(now)
+        if proto != 17 or qs_ip != self.public_ip:
+            return ("drop", "bad_structure", None)
+        cands = [(k, r) for k, r in self.maps.items()
+                 if r[0] == qs_pt and now < r[4]]
+        if not cands:
+            return ("drop", "no_mapping", None)
+        if len(cands) > 1:
+            return ("drop", "ambiguous_reference", None)
+        k, r = cands[0]
+        mid = r[1]
+        if gen != 0 and gen != r[1]:
+            return ("drop", "stale_generation", mid)
+        if (qd_ip, qd_pt) != (k[2], k[3]):
+            return ("drop", "peer_mismatch", mid)
+        return ("ok", (17, os_ip, os_pt, k[0], k[1]), mid)
     def release(self, key, at=None):
         now = self._resolve_at(at)
         _check_key(key)

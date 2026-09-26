@@ -32,6 +32,8 @@ from .model import (
     AllocationResult,
     DropReason,
     Endpoint,
+    ErrorReport,
+    ErrorResult,
     Mapping,
     NATConfig,
     Packet,
@@ -56,6 +58,7 @@ class _Record:
 
     def snapshot(self, key: Key) -> Mapping:
         return Mapping(
+            mapping_id=self.generation,
             key=key,
             internal=self.internal,
             remote=self.remote,
@@ -304,6 +307,58 @@ class AddressDependentNAT:
         rec.expires_at = now + self._config.lifetime
         rewritten = udp_five_tuple(packet.src, rec.internal)
         return TranslationResult(True, rewritten, None, rec.snapshot(key))
+
+    # ------------------------------------------------------------------ #
+    # 差错报文反查（题内合成结构，非真实 ICMP 协议栈）                        #
+    # ------------------------------------------------------------------ #
+
+    def translate_error(self, report: ErrorReport, *, at: int | None = None
+                        ) -> ErrorResult:
+        """差错报文入口：按被引用的原 UDP 五元组反向找回内部端点。
+
+        引用必须是 NAT 改写后的**出站**五元组：src=(公网IP, 外端口)、
+        dst=映射记录的远端、protocol=17。匹配仍有效的映射后，外层目标
+        改写为内部端点。差错报文不创建映射、不刷新寿命（last_seen 与
+        expires_at 均不变）。report.generation 非 0 时必须等于映射当前
+        世代标记，用于排除端口复用后的旧引用；为 0 时不校验，无法排除
+        完全相同五元组的复用（README 已声明此限制）。
+        """
+        now = self._resolve_at(at)
+        if not isinstance(report, ErrorReport):
+            raise ValidationError(
+                f"report must be ErrorReport, got {type(report).__name__}"
+            )
+        self._check_clock(now)
+        self._housekeeping(now)
+        quoted = report.quoted
+        if quoted.protocol != 17 or quoted.src_ip != self._config.public_ip:
+            return ErrorResult(False, None, None, quoted, None,
+                               DropReason.BAD_STRUCTURE, None)
+        # 反向映射：按外端口找候选；同端口同一时刻至多一条活跃映射，
+        # 仍按唯一性校验，多于一条即无法唯一定位。
+        candidates = [
+            (key, rec) for key, rec in self._mappings.items()
+            if rec.external_port == quoted.src_port
+            and now < rec.expires_at
+        ]
+        if not candidates:
+            return ErrorResult(False, None, None, quoted, None,
+                               DropReason.NO_MAPPING, None)
+        if len(candidates) > 1:
+            return ErrorResult(False, None, None, quoted, None,
+                               DropReason.AMBIGUOUS_REFERENCE, None)
+        key, rec = candidates[0]
+        snapshot = rec.snapshot(key)
+        if report.generation != 0 and report.generation != rec.generation:
+            return ErrorResult(False, None, None, quoted, rec.generation,
+                               DropReason.STALE_GENERATION, snapshot)
+        if (quoted.dst_ip, quoted.dst_port) != (rec.remote.ip, rec.remote.port):
+            return ErrorResult(False, None, None, quoted, rec.generation,
+                               DropReason.PEER_MISMATCH, snapshot)
+        outer_dst = rec.internal
+        rewritten = udp_five_tuple(report.outer_src, outer_dst)
+        return ErrorResult(True, outer_dst, rewritten, quoted,
+                           rec.generation, None, snapshot)
 
     # ------------------------------------------------------------------ #
     # 生命周期                                                            #

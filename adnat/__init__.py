@@ -18,6 +18,8 @@ from .model import (
     AllocationResult,
     DropReason,
     Endpoint,
+    ErrorReport,
+    ErrorResult,
     FiveTuple,
     Mapping,
     NATConfig,
@@ -33,6 +35,8 @@ __all__ = [
     "SearchBudgetExhaustedError",
     "Endpoint",
     "FiveTuple",
+    "ErrorReport",
+    "ErrorResult",
     "Packet",
     "Mapping",
     "AllocationRequest",
@@ -45,4 +49,4 @@ __all__ = [
     "MAX_POOL_SIZE",
 ]
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"

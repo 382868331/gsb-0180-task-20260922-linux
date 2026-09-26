@@ -10,8 +10,10 @@
 ## 运行
 
 ```bash
+python -m venv .venv && source .venv/bin/activate   # 准备 venv（可选，无第三方依赖）
 python -m unittest discover -s tests -v   # 必要测试（契约 + 差分）
 python demo.py                            # 固定输入演示，秒级完成
+python demo_iteration.py                  # 分片重组迭代演示，秒级完成
 ```
 
 ## 模型与契约
@@ -73,6 +75,60 @@ nat.stats() -> dict[str, int]
 nat.now -> int
 ```
 
+### 分片重组入口（本轮新增）
+
+```python
+from adnat import (
+    Direction, Fragment, FragmentResult, FragmentationConfig,
+)
+
+nat = AddressDependentNAT(
+    NATConfig(...),
+    FragmentationConfig(
+        max_datagram_size=65535,   # 单数据报重组总长上限（字节）
+        max_fragments=64,          # 单片组最多暂存片数
+        max_cached_bytes=262144,   # 全实例暂存字节总量上限
+        fragment_timeout=30,       # 片组逻辑超时（时间单位）
+    ),
+)
+
+nat.process_fragment(fragment: Fragment, *, at: int | None = None)
+    -> FragmentResult
+nat.fragment_stats() -> dict[str, int]   # fragment_groups / fragment_cached_bytes
+```
+
+`Fragment` 字段：`direction`（`Direction.OUTBOUND/INBOUND`）、
+`src_ip`/`dst_ip`、`protocol`（仅 17=UDP）、`datagram_id`（0..65535）、
+`offset`（字节偏移，8 的倍数）、`more_fragments`、`payload`（非空；
+非末片长度为 8 的倍数）、`src_port`/`dst_port`（**仅首片** offset=0
+携带，非首片必须为 None）。
+
+`FragmentResult`：`accepted` + `complete`；`complete=True` 时
+`rewritten` 为按偏移升序、地址（首片含端口）已改写的全部片；
+`accepted=False` 时 `reason` 为 `DropReason`。
+
+分片契约：
+
+- **关联键** = `(direction, src_ip, dst_ip, protocol, datagram_id)`，
+  不含端口号。同一数据报的片按此键归组。
+- **首片建映射**：首片（offset=0）含 UDP 端口，出站方向可隐式建立
+  映射（容量不足抛 `PortExhaustionError`，不留部分状态）；入站方向
+  按目的端口命中已有映射并校验对端。首片到达时**冻结**映射世代与
+  改写结果，同组后续片一律使用冻结世代。
+- **非首片只暂存**：非首片没有端口，先到时只入缓存，**绝不**凭
+  数据报 ID 猜测任何连接。
+- **重叠冲突**：同组重叠区域字节不一致（或与已知总长矛盾）整组
+  拒绝（`FRAGMENT_OVERLAP_CONFLICT`）；完全重复片幂等（状态不变）。
+- **上限**：重组总长 / 单片组片数 / 全实例缓存字节 / 逻辑超时均有
+  上限，超限整组拒绝（`FRAGMENT_TOO_LONG` / `FRAGMENT_TOO_MANY` /
+  `FRAGMENT_CACHE_FULL`）或由 housekeeping 超时释放（边界即死，
+  `now >= created_at + timeout`）。
+- **释放关联**：数据报齐全、被拒绝或超时后，关联状态立即释放，
+  同一 ID 可安全复用，不串包。映射过期或世代已变（如端口被复用）
+  时旧数据报的迟到片以 `STALE_GENERATION` 拒绝。
+- 旧非分片入口（`translate_outbound/inbound` 等）行为不变；分片
+  入口只做地址/端口改写，载荷字节原样保留（测试用独立重组核对）。
+
 `TranslationResult.accepted=True` 时 `rewritten` 为改写后的 `FiveTuple`
 （UDP，protocol=17）；否则 `reason` 为 `DropReason` 之一：
 `NO_MAPPING` / `STALE_GENERATION` / `PEER_MISMATCH` / `DEST_MISMATCH`。
@@ -126,7 +182,10 @@ generation 比较）均为精确整数运算，比较采用严格不等式
 ## 已知限制
 
 - 仅 UDP（protocol 固定 17）；仅地址依赖映射 + 地址依赖过滤，不含
-  端口依赖/锥形 NAT、hairpin、ALG、分片、ICMP 等行为。
+  端口依赖/锥形 NAT、hairpin、ALG、ICMP 等行为。
+- 分片重组为合成输入模型：不解析真实 IP 头、不做校验和、不处理
+  真实抓包；offset 以字节计（8 的倍数），非末片载荷长度为 8 的
+  倍数；首片判定时不校验 UDP 头与载荷的一致性。
 - 单实例、单线程；状态只在内存中，无持久化。
 - 端口分配为"最小空闲"策略的线性扫描，复杂度 O(池大小)；
   本题上限（65535）下足够。
@@ -145,6 +204,8 @@ adnat/            本题库（可导入）
 tests/
   test_contract.py      契约测试（手工期望值）
   test_differential.py  差分测试（核心 vs 独立字典参考）
+  test_fragments.py     分片重组测试（乱序/超时/复用/冲突/上限）
   reference_nat.py      独立字典参考实现（测试 oracle）
 demo.py           固定输入演示
+demo_iteration.py 分片重组迭代演示（正常 + 边界，秒级完成）
 ```

@@ -37,6 +37,28 @@ class DropReason(enum.Enum):
     DEST_MISMATCH = "dest_mismatch"
     """入站包目的地址不是本 NAT 的固定公网 IP。"""
 
+    FRAGMENT_OVERLAP_CONFLICT = "fragment_overlap_conflict"
+    """同一片组内重叠区域字节不一致（或与已知总长矛盾），整组拒绝。"""
+
+    FRAGMENT_TOO_LONG = "fragment_too_long"
+    """重组后的总长度超过 max_datagram_size，整组拒绝。"""
+
+    FRAGMENT_TOO_MANY = "fragment_too_many"
+    """片组内分片数超过 max_fragments，整组拒绝。"""
+
+    FRAGMENT_CACHE_FULL = "fragment_cache_full"
+    """全实例分片缓存字节达到 max_cached_bytes，整组拒绝。"""
+
+
+class Direction(enum.Enum):
+    """分片数据报的方向。"""
+
+    OUTBOUND = "outbound"
+    """内网 -> 公网。"""
+
+    INBOUND = "inbound"
+    """公网 -> 内网。"""
+
 
 @dataclass(frozen=True, slots=True)
 class Endpoint:
@@ -217,3 +239,135 @@ def udp_five_tuple(src: Endpoint, dst: Endpoint) -> FiveTuple:
         src_ip=src.ip, src_port=src.port,
         dst_ip=dst.ip, dst_port=dst.port,
     )
+
+
+#: IP 数据报 ID 为 16 位字段。
+MAX_DATAGRAM_ID = 65535
+
+
+@dataclass(frozen=True, slots=True)
+class Fragment:
+    """一个 UDP 数据报的分片（合成输入，非真实抓包）。
+
+    同一数据报的所有片由 (direction, src_ip, dst_ip, protocol,
+    datagram_id) 关联；非首片没有端口号，不能据此猜测映射。
+
+    offset:        片内首字节在原始载荷中的字节偏移，必须是 8 的倍数。
+    more_fragments: True 表示后面还有片；False 表示这是最后一片。
+    src_port/dst_port: 仅首片（offset == 0）携带 UDP 端口；非首片必须为 None。
+    """
+
+    direction: Direction
+    src_ip: str
+    dst_ip: str
+    protocol: int
+    datagram_id: int
+    offset: int
+    more_fragments: bool
+    payload: bytes
+    src_port: int | None = None
+    dst_port: int | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.direction, Direction):
+            raise ValidationError(
+                f"Fragment.direction must be Direction, "
+                f"got {type(self.direction).__name__}"
+            )
+        check_ipv4(self.src_ip, "Fragment.src_ip")
+        check_ipv4(self.dst_ip, "Fragment.dst_ip")
+        check_int(self.protocol, "Fragment.protocol", minimum=0, maximum=255)
+        if self.protocol != _PROTOCOL_UDP:
+            raise ValidationError(
+                f"Fragment.protocol must be 17 (UDP), got {self.protocol}"
+            )
+        check_int(self.datagram_id, "Fragment.datagram_id",
+                  minimum=0, maximum=MAX_DATAGRAM_ID)
+        check_int(self.offset, "Fragment.offset", minimum=0, maximum=MAX_TIME)
+        if self.offset % 8 != 0:
+            raise ValidationError(
+                f"Fragment.offset={self.offset} must be a multiple of 8"
+            )
+        if not isinstance(self.more_fragments, bool):
+            raise ValidationError(
+                f"Fragment.more_fragments must be bool, "
+                f"got {type(self.more_fragments).__name__}"
+            )
+        if not isinstance(self.payload, (bytes, bytearray)):
+            raise ValidationError(
+                f"Fragment.payload must be bytes, "
+                f"got {type(self.payload).__name__}"
+            )
+        if len(self.payload) == 0:
+            raise ValidationError("Fragment.payload must be non-empty")
+        if self.more_fragments and len(self.payload) % 8 != 0:
+            raise ValidationError(
+                f"non-last Fragment.payload length {len(self.payload)} "
+                f"must be a multiple of 8"
+            )
+        if self.offset == 0:
+            if self.src_port is None or self.dst_port is None:
+                raise ValidationError(
+                    "first fragment (offset=0) must carry src_port/dst_port"
+                )
+            check_port(self.src_port, "Fragment.src_port")
+            check_port(self.dst_port, "Fragment.dst_port")
+        else:
+            if self.src_port is not None or self.dst_port is not None:
+                raise ValidationError(
+                    "non-first fragment must not carry ports "
+                    "(ports live only in the first fragment)"
+                )
+
+    @property
+    def end(self) -> int:
+        """本片覆盖区间的开区间右端（字节偏移）。"""
+        return self.offset + len(self.payload)
+
+
+@dataclass(frozen=True, slots=True)
+class FragmentResult:
+    """分片处理结果。
+
+    accepted=True, complete=False: 片已暂存，数据报尚未齐。
+    accepted=True, complete=True:  数据报齐全，rewritten 为按偏移升序、
+                                   地址（首片含端口）已改写的全部片；
+                                   关联状态已释放，同 ID 可安全复用。
+    accepted=False: 整组被拒绝并释放，reason 给出原因。
+    """
+
+    accepted: bool
+    complete: bool
+    rewritten: tuple[Fragment, ...] | None
+    reason: DropReason | None
+    mapping: Mapping | None
+
+
+@dataclass(frozen=True, slots=True)
+class FragmentationConfig:
+    """分片重组的资源上限（构造后不可变）。
+
+    max_datagram_size: 单个数据报重组后总长度上限（字节）。
+    max_fragments:     单个片组最多暂存的片数。
+    max_cached_bytes:  全实例所有片组暂存字节总量上限。
+    fragment_timeout:  片组逻辑超时（整数时间单位），从首片入缓存起算，
+                       now >= created_at + timeout 时整组过期释放。
+    """
+
+    max_datagram_size: int = 65535
+    max_fragments: int = 64
+    max_cached_bytes: int = 262144
+    fragment_timeout: int = 30
+
+    def __post_init__(self) -> None:
+        check_int(self.max_datagram_size,
+                  "FragmentationConfig.max_datagram_size",
+                  minimum=1, maximum=MAX_TIME)
+        check_int(self.max_fragments, "FragmentationConfig.max_fragments",
+                  minimum=1, maximum=MAX_TIME)
+        check_int(self.max_cached_bytes,
+                  "FragmentationConfig.max_cached_bytes",
+                  minimum=1, maximum=MAX_TIME)
+        check_int(self.fragment_timeout,
+                  "FragmentationConfig.fragment_timeout",
+                  minimum=1, maximum=MAX_TIME)

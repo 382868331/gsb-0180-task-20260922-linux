@@ -17,6 +17,8 @@ from .model import (
     AllocationRequest,
     AllocationResult,
     DropReason,
+    ErrorPacket,
+    ErrorTranslationResult,
     Endpoint,
     FiveTuple,
     Mapping,
@@ -38,6 +40,8 @@ __all__ = [
     "AllocationRequest",
     "AllocationResult",
     "TranslationResult",
+    "ErrorPacket",
+    "ErrorTranslationResult",
     "DropReason",
     "NATConfig",
     "MAX_TIME",
@@ -45,4 +49,4 @@ __all__ = [
     "MAX_POOL_SIZE",
 ]
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"

@@ -20,6 +20,7 @@ MAX_BATCH_REQUESTS = 65535
 MAX_POOL_SIZE = 65535
 
 _PROTOCOL_UDP = 17
+_PROTOCOL_ICMP = 1
 
 
 class DropReason(enum.Enum):
@@ -32,10 +33,16 @@ class DropReason(enum.Enum):
     """包携带的 generation 与映射当前 generation 不一致（迟到包）。"""
 
     PEER_MISMATCH = "peer_mismatch"
-    """入站包源端点不是该映射记录的对端（地址依赖过滤）。"""
+    """源/引用端点不是该公网端口映射记录的对端（地址依赖过滤）。"""
 
     DEST_MISMATCH = "dest_mismatch"
     """入站包目的地址不是本 NAT 的固定公网 IP。"""
+
+    QUOTE_NOT_UDP = "quote_not_udp"
+    """差错报文引用的原包不是 UDP（本库只按 UDP 映射做反向定位）。"""
+
+    QUOTE_MALFORMED = "quote_malformed"
+    """差错报文引用元组结构不完整，或引用的外层方向自相矛盾。"""
 
 
 @dataclass(frozen=True, slots=True)
@@ -93,6 +100,55 @@ class Packet:
         if not isinstance(self.payload, (bytes, bytearray)):
             raise ValidationError(
                 f"Packet.payload must be bytes, got {type(self.payload).__name__}"
+            )
+
+
+@dataclass(frozen=True, slots=True)
+class ErrorPacket:
+    """题内合成差错报文（ICMP 风格，protocol=1），不做真实协议栈。
+
+    结构（题面明确给出的最小结构）::
+
+        outer:     差错报文本身的外层端点
+                     outer.src = 发出差错报文的网络设备
+                     outer.dst = 本机公网端点（IP + 外端口）
+        quoted:    被引用的原 UDP 数据报（NAT 重写后的公网侧五元组）
+                     quoted.src = 本机公网端点（IP + 外端口）
+                     quoted.dst = 原远端端点
+                     quoted.protocol 必须为 UDP(17)
+        generation: 创建映射时返回的世代标记。0 表示该合成入口不提供
+                     世代标记（见 translate_error 的限制说明）。
+
+    字段类型/取值非法抛 ValidationError；结构完整但无法定位映射的
+    语义问题在 translate_error 中给出 DropReason。
+    """
+
+    outer_src: Endpoint
+    outer_dst: Endpoint
+    quoted_src: Endpoint
+    quoted_dst: Endpoint
+    quoted_protocol: int = _PROTOCOL_UDP
+    generation: int = 0
+    payload: bytes = b""
+
+    def __post_init__(self) -> None:
+        for name, ep in (("outer_src", self.outer_src),
+                         ("outer_dst", self.outer_dst),
+                         ("quoted_src", self.quoted_src),
+                         ("quoted_dst", self.quoted_dst)):
+            if not isinstance(ep, Endpoint):
+                raise ValidationError(
+                    f"ErrorPacket.{name} must be Endpoint, "
+                    f"got {type(ep).__name__}"
+                )
+        check_int(self.quoted_protocol, "ErrorPacket.quoted_protocol",
+                  minimum=0, maximum=255)
+        check_int(self.generation, "ErrorPacket.generation",
+                  minimum=0, maximum=MAX_TIME)
+        if not isinstance(self.payload, (bytes, bytearray)):
+            raise ValidationError(
+                f"ErrorPacket.payload must be bytes, "
+                f"got {type(self.payload).__name__}"
             )
 
 
@@ -158,6 +214,29 @@ class TranslationResult:
 
     accepted: bool
     rewritten: FiveTuple | None
+    reason: DropReason | None
+    mapping: Mapping | None
+
+
+@dataclass(frozen=True, slots=True)
+class ErrorTranslationResult:
+    """差错报文反向定位结果。
+
+    accepted=True 时：
+        outer_target: 差错报文改写后应投递的外层目标（内部端点），
+                      五元组 protocol 固定为 ICMP(1)；
+        quoted:      原样回显的被引用 UDP 五元组（protocol=17）；
+        mapping_id:  采用映射的 ID（即该映射创建时返回的世代标记
+                      generation，全局唯一、单调递增）。
+    accepted=False 时 reason 为 DropReason，其余字段为 None。
+
+    差错报文永不创建映射、不刷新 last_seen/expires_at。
+    """
+
+    accepted: bool
+    outer_target: FiveTuple | None
+    quoted: FiveTuple | None
+    mapping_id: int | None
     reason: DropReason | None
     mapping: Mapping | None
 

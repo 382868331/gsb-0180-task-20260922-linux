@@ -31,15 +31,19 @@ from .model import (
     AllocationRequest,
     AllocationResult,
     DropReason,
+    ErrorPacket,
+    ErrorTranslationResult,
     Endpoint,
     Mapping,
     NATConfig,
     Packet,
     TranslationResult,
+    FiveTuple,
     udp_five_tuple,
 )
 
 Key = tuple[str, int, str, int]
+_PROTOCOL_ICMP = 1
 
 
 @dataclass(slots=True)
@@ -90,6 +94,9 @@ class AddressDependentNAT:
         # 隔离中的端口：port -> 释放时刻（进入隔离的时刻）。
         self._quarantine: dict[int, int] = {}
         self._next_generation = 1
+        # 曾占用各公网端口的世代标记（含已过期/已释放），用于区分
+        # “引用的是端口复用前的旧连接”与“从未有过的引用”。
+        self._port_generations: dict[int, set[int]] = {}
 
     # ------------------------------------------------------------------ #
     # 只读属性                                                            #
@@ -251,6 +258,7 @@ class AddressDependentNAT:
             self._next_generation += 1
             self._mappings[key] = rec
             self._port_to_key[port] = key
+            self._port_generations.setdefault(port, set()).add(rec.generation)
             results.append(AllocationResult(
                 key=key, mapping=rec.snapshot(key), created=True))
         return results
@@ -306,6 +314,92 @@ class AddressDependentNAT:
         return TranslationResult(True, rewritten, None, rec.snapshot(key))
 
     # ------------------------------------------------------------------ #
+    # 差错报文反向定位                                                    #
+    # ------------------------------------------------------------------ #
+
+    def translate_error(self, packet: ErrorPacket,
+                        *, at: int | None = None) -> ErrorTranslationResult:
+        """差错报文入口：按被引用的原 UDP 五元组做反向映射。
+
+        仅处理题面明确给出的合成结构（见 ErrorPacket），不实现完整网络
+        协议栈、不真实发包。匹配必须同时满足：
+
+        1. 外层目的 == 本 NAT 公网 IP（DEST_MISMATCH）；
+        2. 引用协议 == UDP 17（QUOTE_NOT_UDP）；
+        3. 引用源端点 == 外层目的端点（公网 IP + 外端口一致），
+           引用的远端/端口结构可解析（QUOTE_MALFORMED）；
+        4. 该外端口当前仍有有效映射，且记录的对端 == 引用远端，
+           外层源也必须来自该对端（NO_MAPPING / PEER_MISMATCH）；
+        5. 包携带 generation（非 0）时必须等于映射当前世代标记
+           （STALE_GENERATION，排除端口复用后的旧引用）。
+
+        命中后返回改写后的外层目标（ICMP, protocol=1，发往内部端点）、
+        引用的 UDP 五元组与采用映射 ID（即世代标记）。差错报文不创建
+        映射、不刷新 last_seen/expires_at。
+
+        generation=0 表示入口未携带世代标记；此时若公网端口已被完全
+        相同的五元组复用，本库不承诺识别旧引用（见 README 限制）。
+        """
+        now = self._resolve_at(at)
+        self._validate_error_packet(packet)
+        self._check_clock(now)
+        self._housekeeping(now)
+
+        def drop(reason: DropReason, mapping: Mapping | None = None
+                 ) -> ErrorTranslationResult:
+            return ErrorTranslationResult(False, None, None, None,
+                                          reason, mapping)
+
+        if packet.outer_dst.ip != self._config.public_ip:
+            return drop(DropReason.DEST_MISMATCH)
+        if packet.quoted_protocol != 17:
+            return drop(DropReason.QUOTE_NOT_UDP)
+        # 引用的必须是“NAT 重写后在公网上观察到的原包”：引用源必须等于
+        # 外层目的（同一公网端点），否则方向/结构自相矛盾。
+        if (packet.quoted_src.ip, packet.quoted_src.port) != (
+                packet.outer_dst.ip, packet.outer_dst.port):
+            return drop(DropReason.QUOTE_MALFORMED)
+
+        port = packet.outer_dst.port
+        remote_ep = packet.quoted_dst
+        key = self._port_to_key.get(port)
+        if key is None:
+            # 端口当前无有效映射。若曾有同世代映射则是复用前的旧引用。
+            if packet.generation != 0 and packet.generation in \
+                    self._port_generations.get(port, set()):
+                return drop(DropReason.STALE_GENERATION)
+            return drop(DropReason.NO_MAPPING)
+        rec = self._mappings[key]
+        remote_match = (remote_ep.ip, remote_ep.port) == (
+            rec.remote.ip, rec.remote.port)
+        if not remote_match:
+            if packet.generation != 0 and packet.generation in \
+                    self._port_generations.get(port, set()):
+                return drop(DropReason.STALE_GENERATION, rec.snapshot(key))
+            return drop(DropReason.PEER_MISMATCH, rec.snapshot(key))
+        # 外层源同样必须来自映射记录的对端（地址依赖）。
+        if (packet.outer_src.ip, packet.outer_src.port) != (
+                rec.remote.ip, rec.remote.port):
+            return drop(DropReason.PEER_MISMATCH, rec.snapshot(key))
+        if packet.generation != 0 and packet.generation != rec.generation:
+            return drop(DropReason.STALE_GENERATION, rec.snapshot(key))
+
+        quoted = FiveTuple(
+            protocol=17,
+            src_ip=packet.quoted_src.ip, src_port=packet.quoted_src.port,
+            dst_ip=packet.quoted_dst.ip, dst_port=packet.quoted_dst.port,
+        )
+        outer_target = FiveTuple(
+            protocol=_PROTOCOL_ICMP,
+            src_ip=packet.outer_src.ip, src_port=packet.outer_src.port,
+            dst_ip=rec.internal.ip, dst_port=rec.internal.port,
+        )
+        # 注意：不更新 last_seen / expires_at —— 差错报文不延长寿命。
+        return ErrorTranslationResult(
+            True, outer_target, quoted, rec.generation, None,
+            rec.snapshot(key))
+
+    # ------------------------------------------------------------------ #
     # 生命周期                                                            #
     # ------------------------------------------------------------------ #
 
@@ -356,6 +450,14 @@ class AddressDependentNAT:
         """隔离中的端口 -> 进入隔离的时刻。"""
         return dict(self._quarantine)
 
+    def port_generations(self) -> dict[int, tuple[int, ...]]:
+        """每个公网端口曾占用的世代标记（含已过期/已释放映射）。
+
+        供测试 oracle 对照状态；差错入口据此识别端口复用前的旧引用。
+        """
+        return {p: tuple(sorted(gs))
+                for p, gs in self._port_generations.items()}
+
     def stats(self) -> dict[str, int]:
         """计数快照：活跃映射数 / 占用端口 / 隔离端口 / 空闲端口 / 时钟。"""
         live = sum(1 for r in self._mappings.values()
@@ -384,6 +486,13 @@ class AddressDependentNAT:
         if not isinstance(packet, Packet):
             raise ValidationError(
                 f"packet must be Packet, got {type(packet).__name__}"
+            )
+
+    @staticmethod
+    def _validate_error_packet(packet: object) -> None:
+        if not isinstance(packet, ErrorPacket):
+            raise ValidationError(
+                f"packet must be ErrorPacket, got {type(packet).__name__}"
             )
 
     @staticmethod

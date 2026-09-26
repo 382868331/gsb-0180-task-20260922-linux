@@ -8,6 +8,8 @@
     .allocate_many(keys, at=None)   -> list[(key, port, generation, created)]
     .outbound(pkt, at=None)         -> ("ok", five) | ("drop", reason)
     .inbound(pkt, at=None)          -> ("ok", five) | ("drop", reason)
+    .error(epkt, at=None)           -> ("ok", outer, quoted, mapping_id)
+                                     | ("drop", reason)
     .release(key, at=None)          -> bool
     .advance(seconds)               -> list[key]
     .signature()                    -> 可比较的规范化状态元组
@@ -87,6 +89,7 @@ class RefNAT:
         self.port_owner = {}      # port -> key
         self.quarantined = {}     # port -> released_at
         self.next_gen = 1
+        self.port_generations = {}  # port -> set(generation)
 
     # ---- 内部 ----
 
@@ -164,8 +167,61 @@ class RefNAT:
             self.maps[k] = [port, self.next_gen, now, now, now + self.lifetime]
             self.next_gen += 1
             self.port_owner[port] = k
+            self.port_generations.setdefault(port, set()).add(self.maps[k][1])
             out.append((k, port, self.maps[k][1], True))
         return out
+
+    def error(self, epkt, at=None):
+        """差错报文反向定位。epkt::
+
+        (os_ip, os_pt, od_ip, od_pt, qs_ip, qs_pt, qd_ip, qd_pt,
+         q_proto, gen)
+        成功 -> ("ok", 外层ICMP五元组, 引用UDP五元组, mapping_id)
+        失败 -> ("drop", reason)。只读，不改任何寿命/映射状态。
+        """
+        now = self._resolve_at(at)
+        if not (isinstance(epkt, tuple) and len(epkt) == 10):
+            raise RefError("validation", f"bad error packet {epkt!r}")
+        (os_ip, os_pt, od_ip, od_pt, qs_ip, qs_pt,
+         qd_ip, qd_pt, q_proto, gen) = epkt
+        for nm, v in (("os_pt", os_pt), ("od_pt", od_pt),
+                      ("qs_pt", qs_pt), ("qd_pt", qd_pt)):
+            if not _is_int(v) or not 1 <= v <= 65535:
+                raise RefError("validation", f"bad {nm} {v!r}")
+        for nm, v in (("os_ip", os_ip), ("od_ip", od_ip),
+                      ("qs_ip", qs_ip), ("qd_ip", qd_ip)):
+            if not isinstance(v, str):
+                raise RefError("validation", f"bad {nm} {v!r}")
+        if not _is_int(q_proto) or not 0 <= q_proto <= 255:
+            raise RefError("validation", f"bad q_proto {q_proto!r}")
+        if not _is_int(gen) or gen < 0:
+            raise RefError("validation", f"bad gen {gen!r}")
+        self._clock(now)
+        self._housekeep(now)
+        if od_ip != self.public_ip:
+            return ("drop", "dest_mismatch")
+        if q_proto != 17:
+            return ("drop", "quote_not_udp")
+        if (qs_ip, qs_pt) != (od_ip, od_pt):
+            return ("drop", "quote_malformed")
+        key = self.port_owner.get(od_pt)
+        if key is None:
+            if gen != 0 and gen in self.port_generations.get(od_pt, set()):
+                return ("drop", "stale_generation")
+            return ("drop", "no_mapping")
+        rec = self.maps[key]
+        remote_match = (qd_ip, qd_pt) == (key[2], key[3])
+        if not remote_match:
+            if gen != 0 and gen in self.port_generations.get(od_pt, set()):
+                return ("drop", "stale_generation")
+            return ("drop", "peer_mismatch")
+        if (os_ip, os_pt) != (key[2], key[3]):
+            return ("drop", "peer_mismatch")
+        if gen != 0 and gen != rec[1]:
+            return ("drop", "stale_generation")
+        outer = (1, os_ip, os_pt, key[0], key[1])
+        quoted = (17, qs_ip, qs_pt, qd_ip, qd_pt)
+        return ("ok", outer, quoted, rec[1])
 
     def outbound(self, pkt, at=None):
         now = self._resolve_at(at)
@@ -227,4 +283,7 @@ class RefNAT:
             (k, tuple(v)) for k, v in self.maps.items() if self.now < v[4]
         ))
         quar = tuple(sorted(self.quarantined.items()))
-        return (self.now, live, quar, self.next_gen)
+        pgens = tuple(sorted(
+            (p, tuple(sorted(gs))) for p, gs in self.port_generations.items()
+        ))
+        return (self.now, live, quar, self.next_gen, pgens)

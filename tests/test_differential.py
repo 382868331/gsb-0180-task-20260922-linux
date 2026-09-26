@@ -13,6 +13,7 @@ import unittest
 from adnat import (
     AddressDependentNAT,
     AllocationRequest,
+    ErrorPacket,
     Endpoint,
     NATConfig,
     Packet,
@@ -36,12 +37,17 @@ def core_signature(nat: AddressDependentNAT):
                  m.last_seen, m.expires_at))
         for m in nat.snapshot_mappings()
     ))
-    return (nat.now, live, tuple(sorted(nat.quarantined_ports().items())))
+    pgens = tuple(sorted(
+        (p, tuple(sorted(gs)))
+        for p, gs in nat.port_generations().items()
+    ))
+    return (nat.now, live,
+            tuple(sorted(nat.quarantined_ports().items())), pgens)
 
 
 def ref_signature(ref: RefNAT):
-    now, live, quar, _gen = ref.signature()
-    return (now, live, quar)
+    now, live, quar, _gen, pgens = ref.signature()
+    return (now, live, quar, pgens)
 
 
 def core_tag(exc: Exception) -> str:
@@ -150,6 +156,35 @@ class TestDifferential(unittest.TestCase):
             self.assertEqual(c, r, f"advance({seconds}) expired keys")
             check_state()
 
+        def do_error(key, port, gen, *, outer_src=None, quoted_dst=None,
+                     q_proto=17, outer_dst_ip=PUB, quoted_src=None):
+            qd = quoted_dst or Endpoint(key[2], key[3])
+            osrc = outer_src or qd
+            odst = Endpoint(outer_dst_ip, port)
+            qsrc = quoted_src or odst
+            epkt = ErrorPacket(
+                outer_src=osrc, outer_dst=odst,
+                quoted_src=qsrc, quoted_dst=qd,
+                quoted_protocol=q_proto, generation=gen)
+            res = core.translate_error(epkt)
+            if res.accepted:
+                o = res.outer_target
+                core_res = ("ok",
+                            (o.protocol, o.src_ip, o.src_port,
+                             o.dst_ip, o.dst_port),
+                            (res.quoted.protocol, res.quoted.src_ip,
+                             res.quoted.src_port, res.quoted.dst_ip,
+                             res.quoted.dst_port),
+                            res.mapping_id)
+            else:
+                core_res = ("drop", res.reason.value)
+            ref_res = ref.error(
+                (osrc.ip, osrc.port, odst.ip, odst.port,
+                 qsrc.ip, qsrc.port, qd.ip, qd.port, q_proto, gen))
+            self.assertEqual(core_res, ref_res,
+                             f"error key={key} port={port} gen={gen}")
+            check_state()
+
         for _ in range(steps):
             roll = rng.random()
             if roll < 0.28:                       # 单条分配
@@ -172,7 +207,27 @@ class TestDifferential(unittest.TestCase):
                 known = pair.known_gen.get(key, 0)
                 gen = rng.choice([0, known, known + 1])
                 do_inbound(src, port, gen)
-            elif roll < 0.92:                     # 释放
+            elif roll < 0.86:                     # 差错报文
+                key = rng.choice(KEYS)
+                port = pair.known_port.get(key, rng.choice(PORTS))
+                known = pair.known_gen.get(key, 0)
+                gen = rng.choice([0, known, known + 1])
+                r2 = rng.random()
+                if r2 < 0.6:
+                    do_error(key, port, gen)
+                elif r2 < 0.75:
+                    do_error(key, port, gen,
+                             outer_src=rng.choice(REMOTES))
+                elif r2 < 0.85:
+                    do_error(key, port, gen, quoted_dst=rng.choice(REMOTES))
+                elif r2 < 0.92:
+                    do_error(key, port, gen, q_proto=6)
+                elif r2 < 0.96:
+                    do_error(key, port, gen, outer_dst_ip="198.51.100.9")
+                else:
+                    do_error(key, port, gen,
+                             quoted_src=Endpoint(PUB, port + 1 if port < 65535 else port - 1))
+            elif roll < 0.94:                     # 释放
                 do_release(rng.choice(KEYS))
             else:                                 # 推进时钟
                 do_advance(rng.randint(0, 6))

@@ -262,6 +262,134 @@ class TestInboundFiltering(unittest.TestCase):
         self.assertEqual(nat.stats()["live_mappings"], 1)
 
 
+def _build_hairpin_pair(nat, *, lifetime=100, quarantine=5):
+    """在 nat 上建立互为对端的两条回转映射。
+
+    最终状态（最小空闲 + 隔离技巧）：
+      A(10.0.0.8:40000) 对 PUB:6001 的映射 -> 外端口 6002 (pA)，对端 (PUB, 6001)
+      B(10.0.0.9:50000) 对 PUB:6002 的映射 -> 外端口 6001 (pB)，对端 (PUB, 6002)
+    构造步骤：外部占位映射先占 6001；A 映射得 6002；释放占位并等隔离到期，
+    B 映射复用 6001（地址依赖下是另一个 key）。
+    """
+    host_a = Endpoint("10.0.0.8", 40000)
+    host_b = Endpoint("10.0.0.9", 50000)
+    placeholder = Endpoint("192.0.2.55", 1)
+    dummy = nat.allocate(host_b, placeholder)          # 占 6001
+    assert dummy.mapping.external_port == 6001
+    ma = nat.allocate(host_a, Endpoint(PUB, 6001))     # A 得 6002
+    assert ma.mapping.external_port == 6002
+    nat.release(dummy.key)
+    nat.advance(quarantine)                            # 6001 解除隔离
+    mb = nat.allocate(host_b, Endpoint(PUB, 6002))     # B 复用 6001
+    assert mb.mapping.external_port == 6001
+    return host_a, host_b, ma.mapping, mb.mapping
+
+
+class TestHairpin(unittest.TestCase):
+    """内部回转：内部主机经对方公网映射互访，双向端点同时改写。"""
+
+    def test_request_and_reply_endpoint_rewrite(self):
+        nat = make_nat(ports=(6001, 6002, 6003), lifetime=100, quarantine=5)
+        host_a, host_b, ma, mb = _build_hairpin_pair(nat)
+
+        # A -> 公网映射 (PUB, pB=6001)：源改成 (PUB, pA=6002)，目的改成 B。
+        req = nat.translate_outbound(Packet(
+            src=host_a, dst=Endpoint(PUB, mb.external_port),
+            generation=ma.generation, peer_generation=mb.generation))
+        self.assertTrue(req.accepted)
+        self.assertEqual(
+            (req.rewritten.src_ip, req.rewritten.src_port,
+             req.rewritten.dst_ip, req.rewritten.dst_port),
+            (PUB, ma.external_port, host_b.ip, host_b.port),
+        )
+        # B 的回复：源改成 (PUB, pB=6001)，目的改回 A。
+        rep = nat.translate_outbound(Packet(
+            src=host_b, dst=Endpoint(PUB, ma.external_port),
+            generation=mb.generation, peer_generation=ma.generation))
+        self.assertTrue(rep.accepted)
+        self.assertEqual(
+            (rep.rewritten.src_ip, rep.rewritten.src_port,
+             rep.rewritten.dst_ip, rep.rewritten.dst_port),
+            (PUB, mb.external_port, host_a.ip, host_a.port),
+        )
+
+    def test_stale_generation_either_side_rejected(self):
+        nat = make_nat(ports=(6001, 6002, 6003), lifetime=100, quarantine=5)
+        host_a, host_b, ma, mb = _build_hairpin_pair(nat)
+        # 源侧旧代数 -> STALE_GENERATION。
+        bad_src = nat.translate_outbound(Packet(
+            src=host_a, dst=Endpoint(PUB, mb.external_port),
+            generation=ma.generation + 9, peer_generation=mb.generation))
+        self.assertIs(bad_src.reason, DropReason.STALE_GENERATION)
+        # 目的侧旧代数（目标映射已换代，旧回复迟到）-> STALE_GENERATION。
+        bad_dst = nat.translate_outbound(Packet(
+            src=host_a, dst=Endpoint(PUB, mb.external_port),
+            generation=ma.generation, peer_generation=mb.generation + 9))
+        self.assertIs(bad_dst.reason, DropReason.STALE_GENERATION)
+        # peer_generation=0 表示不校验目的侧代数（仍按当前映射送达）。
+        ok = nat.translate_outbound(Packet(
+            src=host_a, dst=Endpoint(PUB, mb.external_port),
+            generation=ma.generation))
+        self.assertTrue(ok.accepted)
+
+    def test_source_filter_still_applies(self):
+        nat = make_nat(ports=(6001, 6002, 6003), lifetime=100, quarantine=5)
+        host_a, host_b, ma, mb = _build_hairpin_pair(nat)
+        # B 若把映射指向外部主机（而非 A 的公网端点），回转被来源过滤拒绝。
+        ext = Endpoint("198.51.100.77", 999)
+        nat.release(mb.key)
+        nat.advance(5)
+        mb2 = nat.allocate(host_b, ext).mapping  # 6001 复用，对端变成外部
+        self.assertEqual(mb2.external_port, 6001)
+        blocked = nat.translate_outbound(Packet(
+            src=host_a, dst=Endpoint(PUB, 6001),
+            generation=ma.generation, peer_generation=mb2.generation))
+        self.assertFalse(blocked.accepted)
+        self.assertIs(blocked.reason, DropReason.PEER_MISMATCH)
+
+    def test_target_mapping_expired_port_reassigned_old_reply_lost(self):
+        """目标映射过期、端口被新设备拿走后，迟到回转包不得送到新设备。"""
+        nat = make_nat(ports=(6001, 6002, 6003), lifetime=10, quarantine=5)
+        host_a, host_b, ma, mb = _build_hairpin_pair(nat, lifetime=10)
+        old_b_gen = mb.generation
+        nat.advance(10)                          # 两侧映射同时过期
+        self.assertIsNone(nat.get_mapping(ma.key))
+        self.assertIsNone(nat.get_mapping(mb.key))
+        nat.advance(5)                           # 端口解除隔离
+        host_c = Endpoint("10.0.0.10", 51000)
+        # 新内部设备 C 先拿走原 B 的外端口 6001（对端是外部，不指向 A）。
+        mc = nat.allocate(host_c, Endpoint("198.51.100.9", 9))
+        self.assertEqual(mc.mapping.external_port, 6001)
+        # A 重建其回转映射得 6002（key 不变，generation 递增）。
+        ma2 = nat.allocate(host_a, Endpoint(PUB, 6001))
+        self.assertEqual(ma2.mapping.external_port, 6002)
+        # A 携带源侧新代数、目的侧 B 的旧代数：旧回复迟到，必须 STALE，
+        # 绝不能改写到 C。
+        late = nat.translate_outbound(Packet(
+            src=host_a, dst=Endpoint(PUB, 6001),
+            generation=ma2.mapping.generation,
+            peer_generation=old_b_gen))
+        self.assertFalse(late.accepted)
+        self.assertIs(late.reason, DropReason.STALE_GENERATION)
+        self.assertIsNone(late.rewritten)
+        # 即便省略代数校验（peer_generation=0），C 的对端不是 A 的公网
+        # 端点，来源过滤仍然拦截。
+        filtered = nat.translate_outbound(Packet(
+            src=host_a, dst=Endpoint(PUB, 6001)))
+        self.assertIs(filtered.reason, DropReason.PEER_MISMATCH)
+
+    def test_disabled_hairpin(self):
+        nat = AddressDependentNAT(NATConfig(
+            public_ip=PUB, external_ports=(6001, 6002, 6003),
+            lifetime=100, quarantine=5, hairpin=False))
+        host_a, host_b, ma, mb = _build_hairpin_pair(nat)
+        r = nat.translate_outbound(Packet(
+            src=host_a, dst=Endpoint(PUB, mb.external_port),
+            generation=ma.generation, peer_generation=mb.generation))
+        self.assertFalse(r.accepted)
+        self.assertIs(r.reason, DropReason.HAIRPIN_DISABLED)
+
+
 class TestRelease(unittest.TestCase):
     def test_release_semantics(self):
         nat = make_nat()

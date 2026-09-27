@@ -37,6 +37,9 @@ class DropReason(enum.Enum):
     DEST_MISMATCH = "dest_mismatch"
     """入站包目的地址不是本 NAT 的固定公网 IP。"""
 
+    HAIRPIN_DISABLED = "hairpin_disabled"
+    """内部包目的是本 NAT 公网映射，但配置关闭了内部回转。"""
+
 
 @dataclass(frozen=True, slots=True)
 class Endpoint:
@@ -70,14 +73,17 @@ class FiveTuple:
 
 @dataclass(frozen=True, slots=True)
 class Packet:
-    """合成 UDP 包。generation 为发送方观测到的映射代数，用于拒绝迟到包。
+    """合成 UDP 包。
 
-    不知道 generation 时传 0，表示"不参与代数校验"（按当前映射处理）。
+    generation 为发送方（源）映射的观测代数；内部回转包可再用
+    peer_generation 携带"目的公网映射"的观测代数，任一与当前代数不一致
+    （且非 0）即判迟到包丢弃。0 表示该侧不参与代数校验。
     """
 
     src: Endpoint
     dst: Endpoint
     generation: int = 0
+    peer_generation: int = 0
     payload: bytes = b""
 
     def __post_init__(self) -> None:
@@ -90,6 +96,8 @@ class Packet:
                 f"Packet.dst must be Endpoint, got {type(self.dst).__name__}"
             )
         check_int(self.generation, "Packet.generation", minimum=0, maximum=MAX_TIME)
+        check_int(self.peer_generation, "Packet.peer_generation",
+                  minimum=0, maximum=MAX_TIME)
         if not isinstance(self.payload, (bytes, bytearray)):
             raise ValidationError(
                 f"Packet.payload must be bytes, got {type(self.payload).__name__}"
@@ -178,6 +186,7 @@ class NATConfig:
     lifetime: int = 300
     quarantine: int = 60
     search_budget: int | None = None
+    hairpin: bool = True
 
     def __post_init__(self) -> None:
         check_ipv4(self.public_ip, "NATConfig.public_ip")
@@ -208,6 +217,11 @@ class NATConfig:
         else:
             check_int(self.search_budget, "NATConfig.search_budget",
                       minimum=1, maximum=MAX_TIME)
+        if not isinstance(self.hairpin, bool):
+            raise ValidationError(
+                f"NATConfig.hairpin must be bool, "
+                f"got {type(self.hairpin).__name__}"
+            )
 
 
 def udp_five_tuple(src: Endpoint, dst: Endpoint) -> FiveTuple:

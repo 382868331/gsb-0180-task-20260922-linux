@@ -56,6 +56,43 @@ def main() -> None:
     show_five("五元组", back.rewritten)
     assert back.rewritten.dst_ip == HOST.ip and back.rewritten.dst_port == HOST.port
 
+    print("\n[1b] 内部回转：两台内网主机经对方公网映射互访")
+    hp_pool = (7100, 7101, 7102)
+    hp = AddressDependentNAT(NATConfig(
+        public_ip=PUB, external_ports=hp_pool, lifetime=60, quarantine=5))
+    ha = Endpoint("10.1.0.8", 40000)
+    hb = Endpoint("10.1.0.9", 50000)
+    outside = Endpoint("192.0.2.77", 9)
+    dummy = hp.allocate(hb, outside)              # B 占位占 7100
+    ma = hp.allocate(ha, Endpoint(PUB, 7100)).mapping   # A 回转映射 7101
+    hp.release(dummy.key)
+    hp.advance(5)                                 # 7100 隔离到期
+    mb = hp.allocate(hb, Endpoint(PUB, 7101)).mapping   # B 复用 7100
+    print(f"    A 映射: 外端口={ma.external_port} 对端={ma.remote.ip}:"
+          f"{ma.remote.port} gen={ma.generation}")
+    print(f"    B 映射: 外端口={mb.external_port} 对端={mb.remote.ip}:"
+          f"{mb.remote.port} gen={mb.generation}")
+    hp_req = hp.translate_outbound(Packet(
+        src=ha, dst=Endpoint(PUB, mb.external_port),
+        generation=ma.generation, peer_generation=mb.generation))
+    print(f"  请求 {ha.ip}:{ha.port} -> {PUB}:{mb.external_port} 回转改写:")
+    show_five("五元组", hp_req.rewritten)
+    hp_rep = hp.translate_outbound(Packet(
+        src=hb, dst=Endpoint(PUB, ma.external_port),
+        generation=mb.generation, peer_generation=ma.generation))
+    print(f"  回复 {hb.ip}:{hb.port} -> {PUB}:{ma.external_port} 回转改写:")
+    show_five("五元组", hp_rep.rewritten)
+    assert (hp_req.rewritten.src_port, hp_req.rewritten.dst_ip,
+            hp_req.rewritten.dst_port) == (ma.external_port, hb.ip, hb.port)
+    assert (hp_rep.rewritten.src_port, hp_rep.rewritten.dst_ip,
+            hp_rep.rewritten.dst_port) == (mb.external_port, ha.ip, ha.port)
+    late = hp.translate_outbound(Packet(
+        src=ha, dst=Endpoint(PUB, mb.external_port),
+        generation=ma.generation, peer_generation=mb.generation + 1))
+    print(f"  携带目的侧旧代数的迟到回转包: accepted={late.accepted} "
+          f"reason={late.reason.value}")
+    assert not late.accepted and late.reason.value == "stale_generation"
+
     print("\n[2a] 异常边界：端口池耗尽 -> 批量分配整体回滚")
     filler = [AllocationRequest(Endpoint("10.0.0.9", p), WEB_A)
               for p in (5001, 5002, 5003, 5004)]   # 占满剩余 4 口

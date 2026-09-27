@@ -261,11 +261,19 @@ class AddressDependentNAT:
 
     def translate_outbound(self, packet: Packet, *, at: int | None = None
                            ) -> TranslationResult:
-        """出站：内网 -> 公网。不隐式建映射；无映射即丢弃（NO_MAPPING）。"""
+        """出站：内网 -> 公网。不隐式建映射；无映射即丢弃（NO_MAPPING）。
+
+        目的为本 NAT 公网 IP 的内部包按内部回转（hairpin）处理：
+        必须同时存在源侧（内部源 -> 目的公网端点）与目的侧（目标内部
+        主机 -> 源公网端点）两条活跃映射，且各自 generation 校验通过、
+        对端过滤成立，才同时改写源、目的端点。
+        """
         now = self._resolve_at(at)
         self._validate_packet(packet)
         self._check_clock(now)
         self._housekeeping(now)
+        if packet.dst.ip == self._config.public_ip:
+            return self._translate_hairpin(packet, now)
         key = (packet.src.ip, packet.src.port, packet.dst.ip, packet.dst.port)
         rec = self._mappings.get(key)
         if rec is None:
@@ -279,6 +287,59 @@ class AddressDependentNAT:
         rewritten = udp_five_tuple(
             Endpoint(self._config.public_ip, rec.external_port), packet.dst)
         return TranslationResult(True, rewritten, None, rec.snapshot(key))
+
+    def _translate_hairpin(self, packet: Packet, now: int) -> TranslationResult:
+        """内部回转：内网 A 经公网映射访问内网 B（B 的回复同理反向命中）。
+
+        前置状态（两侧映射必须互为对端，任何一侧缺失/过期/代数不符/
+        对端不符都丢弃，且不刷新任何映射）::
+
+            src 映射: key=(A, PUB:pB) -> 外端口 pA，记录对端 (PUB, pB)
+            dst 映射: 外端口 pB 的属主 key=(B, PUB:pA)，记录对端 (PUB, pA)
+
+        改写后五元组：(PUB, pA) -> B。B 的回复同理：源 B、目的 (PUB, pA)
+        再次命中本分支（两侧映射互换），改写为 (PUB, pB) -> A。
+        """
+        if not self._config.hairpin:
+            return TranslationResult(
+                False, None, DropReason.HAIRPIN_DISABLED, None)
+        dst_key = self._port_to_key.get(packet.dst.port)
+        if dst_key is None:
+            return TranslationResult(False, None, DropReason.NO_MAPPING, None)
+        dst_rec = self._mappings[dst_key]
+        src_key = (packet.src.ip, packet.src.port,
+                   self._config.public_ip, packet.dst.port)
+        src_rec = self._mappings.get(src_key)
+        if src_rec is None:
+            return TranslationResult(
+                False, None, DropReason.NO_MAPPING, dst_rec.snapshot(dst_key))
+        # 代数校验先于对端过滤：旧映射上的迟到回转包一律不送。
+        if packet.generation != 0 and packet.generation != src_rec.generation:
+            return TranslationResult(
+                False, None, DropReason.STALE_GENERATION,
+                src_rec.snapshot(src_key))
+        if packet.peer_generation != 0 \
+                and packet.peer_generation != dst_rec.generation:
+            return TranslationResult(
+                False, None, DropReason.STALE_GENERATION,
+                dst_rec.snapshot(dst_key))
+        src_public = Endpoint(self._config.public_ip, src_rec.external_port)
+        # 目的侧映射记录的对端必须就是源侧公网端点；否则回复方向过不了
+        # 原有的地址依赖来源过滤（也排除自己回转给自己）。
+        if (dst_rec.remote.ip, dst_rec.remote.port) != \
+                (src_public.ip, src_public.port) \
+                or (dst_rec.internal.ip, dst_rec.internal.port) == \
+                (packet.src.ip, packet.src.port):
+            return TranslationResult(
+                False, None, DropReason.PEER_MISMATCH,
+                dst_rec.snapshot(dst_key))
+        self._check_expiry_overflow(now)
+        src_rec.last_seen = now
+        src_rec.expires_at = now + self._config.lifetime
+        dst_rec.last_seen = now
+        dst_rec.expires_at = now + self._config.lifetime
+        rewritten = udp_five_tuple(src_public, dst_rec.internal)
+        return TranslationResult(True, rewritten, None, src_rec.snapshot(src_key))
 
     def translate_inbound(self, packet: Packet, *, at: int | None = None
                           ) -> TranslationResult:

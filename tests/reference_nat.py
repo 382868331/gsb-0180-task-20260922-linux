@@ -17,7 +17,7 @@
 差分测试只比对 tag 与公开结果，不比对异常类型本身。
 
 key  = (内网IP, 内网端口, 目的IP, 目的端口)
-pkt  = (src_ip, src_port, dst_ip, dst_port, generation)
+pkt  = (src_ip, src_port, dst_ip, dst_port, generation[, peer_generation])
 five = (17, src_ip, src_port, dst_ip, dst_port)
 """
 
@@ -60,7 +60,8 @@ def _check_pkt(pkt) -> None:
 class RefNAT:
     """字典版地址依赖 NAT：与 adnat 同一契约、独立实现。"""
 
-    def __init__(self, public_ip, ports, lifetime, quarantine, budget=None):
+    def __init__(self, public_ip, ports, lifetime, quarantine, budget=None,
+                 hairpin=True):
         if not isinstance(public_ip, str):
             raise RefError("validation", "public_ip must be str")
         ports = tuple(ports)
@@ -76,11 +77,14 @@ class RefNAT:
             budget = len(ports)
         if not _is_int(budget) or budget < 1:
             raise RefError("validation", "bad budget")
+        if not isinstance(hairpin, bool):
+            raise RefError("validation", "bad hairpin")
         self.public_ip = public_ip
         self.ports = tuple(sorted(ports))
         self.lifetime = lifetime
         self.quarantine = quarantine
         self.budget = budget
+        self.hairpin = hairpin
         self.now = 0
         # key -> [port, generation, created_at, last_seen, expires_at]
         self.maps = {}
@@ -169,10 +173,41 @@ class RefNAT:
 
     def outbound(self, pkt, at=None):
         now = self._resolve_at(at)
-        _check_pkt(pkt)
+        base = pkt
+        peer_gen = 0
+        if len(pkt) == 6:
+            base, peer_gen = pkt[:5], pkt[5]
+        _check_pkt(base)
+        if not _is_int(peer_gen) or peer_gen < 0:
+            raise RefError("validation", f"bad peer_generation {peer_gen!r}")
+        pkt = base
         self._clock(now)
         self._housekeep(now)
         s_ip, s_pt, d_ip, d_pt, gen = pkt
+        if d_ip == self.public_ip:
+            if not self.hairpin:
+                return ("drop", "hairpin_disabled")
+            dst_key = self.port_owner.get(d_pt)
+            if dst_key is None:
+                return ("drop", "no_mapping")
+            dst_rec = self.maps[dst_key]
+            skey = (s_ip, s_pt, d_ip, d_pt)
+            src_rec = self.maps.get(skey)
+            if src_rec is None:
+                return ("drop", "no_mapping")
+            if gen != 0 and gen != src_rec[1]:
+                return ("drop", "stale_generation")
+            if peer_gen != 0 and peer_gen != dst_rec[1]:
+                return ("drop", "stale_generation")
+            src_pub = (self.public_ip, src_rec[0])
+            if (dst_key[2], dst_key[3]) != src_pub:
+                return ("drop", "peer_mismatch")
+            if (dst_key[0], dst_key[1]) == (s_ip, s_pt):
+                return ("drop", "peer_mismatch")
+            src_rec[3] = dst_rec[3] = now
+            src_rec[4] = dst_rec[4] = now + self.lifetime
+            return ("ok", (17, src_pub[0], src_pub[1],
+                           dst_key[0], dst_key[1]))
         key = (s_ip, s_pt, d_ip, d_pt)
         rec = self.maps.get(key)
         if rec is None:

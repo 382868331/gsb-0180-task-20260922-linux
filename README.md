@@ -22,6 +22,13 @@ python demo.py                            # 固定输入演示，秒级完成
   （池可乱序给出，内部升序去重）。
 - **入站过滤**：包必须命中某映射的外端口，且源端点 == 该映射记录的对端，
   目的 IP == 公网 IP，否则丢弃。
+- **内部回转（hairpin）**：内部主机经对方的公网映射互访时，
+  `translate_outbound` 识别"目的 IP == 公网 IP"的内部包。必须同时存在
+  两条活跃映射（源主机 -> 目的公网端点；目的外端口属主 -> 源公网端点），
+  且**两侧 generation 分别校验通过、互为记录对端**，才把五元组改写为
+  `(公网IP, 源外端口) -> 目的内部端点`；回复方向同理（两侧互换）。
+  任何一侧映射缺失/过期/代数不符/对端不符都丢弃，且不刷新任何映射。
+  由 `NATConfig.hairpin=False` 可关闭，关闭时返回 `HAIRPIN_DISABLED`。
 - **时间**：显式整数时钟。`advance(seconds)` 推进；每次公开调用先按当前
   时钟做 housekeeping（过期回收、隔离到期释放）再处理请求。时钟只增不减。
   映射在 `now >= expires_at` 时过期（**边界即死**）；成功改写的包刷新
@@ -54,6 +61,7 @@ nat = AddressDependentNAT(NATConfig(
     lifetime=300,        # 映射空闲存活（整数时间单位），>= 1
     quarantine=60,       # 端口释放后隔离时长 Q，>= 0
     search_budget=None,  # 单次分配最多检查的端口数；None = 池大小（全池扫描）
+    hairpin=True,        # 是否允许内部主机经公网映射互访（内部回转）
 ))
 
 nat.allocate(internal: Endpoint, remote: Endpoint, *, at: int | None = None)
@@ -75,7 +83,15 @@ nat.now -> int
 
 `TranslationResult.accepted=True` 时 `rewritten` 为改写后的 `FiveTuple`
 （UDP，protocol=17）；否则 `reason` 为 `DropReason` 之一：
-`NO_MAPPING` / `STALE_GENERATION` / `PEER_MISMATCH` / `DEST_MISMATCH`。
+`NO_MAPPING` / `STALE_GENERATION` / `PEER_MISMATCH` / `DEST_MISMATCH` /
+`HAIRPIN_DISABLED`。
+
+`Packet(src, dst, generation=0, peer_generation=0, payload=b"")` 中
+`peer_generation` 为回转包"目的侧公网映射"的观测代数，与源侧的
+`generation` 分别校验、互不混用；0 表示该侧不校验。目标映射过期、
+端口被重新分配给其他内部设备时，迟到回转包因目的侧代数不符
+（`STALE_GENERATION`）或对端不符（`PEER_MISMATCH`）被丢弃，
+绝不会送到新设备。
 
 ## 错误语义
 
@@ -120,13 +136,19 @@ generation 比较）均为精确整数运算，比较采用严格不等式
   只有成功的包改写刷新（模拟真实流量保活）。
 - **`generation=0` 豁免**：不知道代号的调用方（如首包）可传 0 跳过
   迟到校验，避免强制所有调用方跟踪代号。
+- **回转复用既有映射**：hairpin 不新建任何映射、不放松任何过滤；它要求
+  两侧 key 在普通出站分配阶段就已存在且互相指向。成功回转同时刷新两侧
+  映射的过期时间（双向都视为真实流量保活）；失败不刷新任何一侧。
+- **回转双代数**：`generation` 与 `peer_generation` 分属源/目的两条映射，
+  不允许用一个代数同时代表两侧，从结构上防止旧回复串到新设备。
 - **参考实现独立**：`tests/reference_nat.py` 只用字典/元组重写同一契约，
   不导入被测核心；差分测试逐操作比对公开结果与规范化状态签名。
 
 ## 已知限制
 
-- 仅 UDP（protocol 固定 17）；仅地址依赖映射 + 地址依赖过滤，不含
-  端口依赖/锥形 NAT、hairpin、ALG、分片、ICMP 等行为。
+- 仅 UDP（protocol 固定 17）；仅地址依赖映射 + 地址依赖过滤，并支持
+  同一套映射/过滤规则上的内部回转（hairpin）；不含端口依赖/锥形 NAT、
+  ALG、分片、ICMP 等行为。回转不改写 payload，不做 NAT ALG。
 - 单实例、单线程；状态只在内存中，无持久化。
 - 端口分配为"最小空闲"策略的线性扫描，复杂度 O(池大小)；
   本题上限（65535）下足够。

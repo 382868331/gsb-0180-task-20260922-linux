@@ -187,9 +187,90 @@ class TestDifferential(unittest.TestCase):
             (31337, 600, 6, 3, 2),
         ]
         for seed, steps, lifetime, quarantine, budget in scenarios:
-            with self.subTest(seed=seed, lifetime=lifetime,
-                              quarantine=quarantine, budget=budget):
-                self.run_scenario(seed, steps, lifetime, quarantine, budget)
+                with self.subTest(seed=seed, lifetime=lifetime,
+                                  quarantine=quarantine, budget=budget):
+                    self.run_scenario(seed, steps, lifetime, quarantine, budget)
+
+    def test_hairpin_random_walk_matches_reference(self):
+        """内部回转的双向改写、过滤与迟到拒绝：核心 vs 独立参考。"""
+        for seed, hairpin in ((11, True), (22, False)):
+            with self.subTest(seed=seed, hairpin=hairpin):
+                rng = random.Random(seed)
+                lifetime, quarantine = 200, 3
+                hp_ports = (7001, 7002, 7003, 7004, 7005)
+                core = AddressDependentNAT(NATConfig(
+                    public_ip=PUB, external_ports=hp_ports,
+                    lifetime=lifetime, quarantine=quarantine,
+                    hairpin=hairpin))
+                ref = RefNAT(PUB, hp_ports, lifetime, quarantine,
+                             len(hp_ports), hairpin=hairpin)
+                host_a, host_b = INTERNALS[0], INTERNALS[1]
+                ext = REMOTES[0]
+
+                def alloc(c_key):
+                    c = core.allocate_many([
+                        AllocationRequest(Endpoint(c_key[0], c_key[1]),
+                                          Endpoint(c_key[2], c_key[3]))])
+                    r = ref.allocate_many([c_key])
+                    self.assertEqual(
+                        [(x.key, x.mapping.external_port, x.mapping.generation)
+                         for x in c],
+                        [(k, p, g) for (k, p, g, _c) in r])
+                    return c[0].mapping
+
+                def release(c_key):
+                    self.assertEqual(core.release(c_key), ref.release(c_key))
+
+                # B 的占位映射占 7001；A 对 PUB:7001 的回转映射得 7002；
+                # 释放占位并等隔离到期后，B 对 PUB:7002 的映射复用 7001。
+                dummy_a = (host_a.ip, host_a.port, ext.ip, ext.port)
+                dummy_b = (host_b.ip, host_b.port, ext.ip, ext.port)
+                alloc(dummy_b)           # B 占位:7001
+                alloc(dummy_a)           # A 占位:7002（稍后不用，保持占用无关端口）
+                ka = (host_a.ip, host_a.port, PUB, 7001)
+                ma = alloc(ka)           # A 回转映射:7003
+                release(dummy_b)
+                core.advance(quarantine)
+                ref.advance(quarantine)
+                kb = (host_b.ip, host_b.port, PUB, ma.external_port)
+                mb = alloc(kb)           # B 复用 7001
+                self.assertEqual(mb.remote, Endpoint(PUB, ma.external_port))
+                self.assertEqual(ma.remote, Endpoint(PUB, mb.external_port))
+
+                gens = {"a": ma.generation, "b": mb.generation}
+
+                def hp(src, dst_port, gen, peer_gen):
+                    pkt = Packet(src=src, dst=Endpoint(PUB, dst_port),
+                                 generation=gen, peer_generation=peer_gen)
+                    c_res = norm_core_translation(
+                        core.translate_outbound(pkt))
+                    r_res = ref.outbound(
+                        (src.ip, src.port, PUB, dst_port, gen, peer_gen))
+                    self.assertEqual(c_res, r_res)
+
+                for _ in range(60):
+                    roll = rng.random()
+                    if roll < 0.35:                       # A -> B 回转
+                        gen = rng.choice([0, gens["a"], gens["a"] + 5])
+                        peer = rng.choice([0, gens["b"], gens["b"] + 5])
+                        hp(host_a, mb.external_port, gen, peer)
+                    elif roll < 0.70:                     # B -> A 回转
+                        gen = rng.choice([0, gens["b"], gens["b"] + 5])
+                        peer = rng.choice([0, gens["a"], gens["a"] + 5])
+                        hp(host_b, ma.external_port, gen, peer)
+                    else:                                 # 时钟推进
+                        seconds = rng.choice([0, 1, 2, 5])
+                        self.assertEqual(core.advance(seconds),
+                                         ref.advance(seconds))
+                check_state_hp = (
+                    tuple(sorted(
+                        (m.key, (m.external_port, m.generation, m.created_at,
+                                 m.last_seen, m.expires_at))
+                        for m in core.snapshot_mappings())),
+                    tuple(sorted(core.quarantined_ports().items())),
+                )
+                now, live, quar, _g = ref.signature()
+                self.assertEqual(check_state_hp, (live, quar))
 
 
 if __name__ == "__main__":

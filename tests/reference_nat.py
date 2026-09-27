@@ -181,6 +181,10 @@ class RefNAT:
             return ("drop", "stale_generation")
         rec[3] = now
         rec[4] = now + self.lifetime
+        if d_ip == self.public_ip:
+            # 内部回转：出站改写后继续走入站腿，不绕过对端过滤。
+            # generation 只属发送方自己的映射，入站腿按 0 处理。
+            return self._inbound_leg(self.public_ip, rec[0], d_pt, 0, now)
         return ("ok", (17, self.public_ip, rec[0], d_ip, d_pt))
 
     def inbound(self, pkt, at=None):
@@ -191,6 +195,9 @@ class RefNAT:
         s_ip, s_pt, d_ip, d_pt, gen = pkt
         if d_ip != self.public_ip:
             return ("drop", "dest_mismatch")
+        return self._inbound_leg(s_ip, s_pt, d_pt, gen, now)
+
+    def _inbound_leg(self, s_ip, s_pt, d_pt, gen, now):
         key = self.port_owner.get(d_pt)
         if key is None:
             return ("drop", "no_mapping")

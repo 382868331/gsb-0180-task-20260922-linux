@@ -261,7 +261,16 @@ class AddressDependentNAT:
 
     def translate_outbound(self, packet: Packet, *, at: int | None = None
                            ) -> TranslationResult:
-        """出站：内网 -> 公网。不隐式建映射；无映射即丢弃（NO_MAPPING）。"""
+        """出站：内网 -> 公网。不隐式建映射；无映射即丢弃（NO_MAPPING）。
+
+        内部回转（hairpin）：若目的 IP 就是本 NAT 的公网 IP，则在完成
+        出站改写后不离开 NAT，直接以改写后的包继续走入站腿——要求
+        目的外端口命中另一条活跃映射，且改写后的源端点 == 该映射记录的
+        对端（不绕过地址依赖过滤）。包携带的 generation 是发送方对
+        *自己* 映射的观测，只在出站腿校验；入站腿按 generation=0 处理，
+        由实时映射查找（过期即 NO_MAPPING）与对端过滤保证不投递给
+        错误的内部设备。任一检查失败即丢弃。
+        """
         now = self._resolve_at(at)
         self._validate_packet(packet)
         self._check_clock(now)
@@ -276,8 +285,13 @@ class AddressDependentNAT:
         self._check_expiry_overflow(now)
         rec.last_seen = now
         rec.expires_at = now + self._config.lifetime
-        rewritten = udp_five_tuple(
-            Endpoint(self._config.public_ip, rec.external_port), packet.dst)
+        hairpin_src = Endpoint(self._config.public_ip, rec.external_port)
+        if packet.dst.ip == self._config.public_ip:
+            # 内部回转：源已改写为 (公网IP, 本映射外端口)，继续入站腿；
+            # generation 只属发送方自己的映射，入站腿按 0（不参与校验）。
+            return self._inbound_leg(
+                hairpin_src, packet.dst, 0, now)
+        rewritten = udp_five_tuple(hairpin_src, packet.dst)
         return TranslationResult(True, rewritten, None, rec.snapshot(key))
 
     def translate_inbound(self, packet: Packet, *, at: int | None = None
@@ -289,20 +303,29 @@ class AddressDependentNAT:
         self._housekeeping(now)
         if packet.dst.ip != self._config.public_ip:
             return TranslationResult(False, None, DropReason.DEST_MISMATCH, None)
-        key = self._port_to_key.get(packet.dst.port)
+        return self._inbound_leg(packet.src, packet.dst, packet.generation, now)
+
+    def _inbound_leg(self, src: Endpoint, dst: Endpoint, generation: int,
+                     now: int) -> TranslationResult:
+        """入站腿（公网 -> 内网）的共享实现，也用于内部回转的第二段。
+
+        dst.ip 必须为公网 IP（调用方保证）。命中映射后做 generation
+        迟到校验与对端过滤，全部通过才改写目的为内网端点并刷新映射。
+        """
+        key = self._port_to_key.get(dst.port)
         if key is None:
             return TranslationResult(False, None, DropReason.NO_MAPPING, None)
         rec = self._mappings[key]
-        if packet.generation != 0 and packet.generation != rec.generation:
+        if generation != 0 and generation != rec.generation:
             return TranslationResult(
                 False, None, DropReason.STALE_GENERATION, rec.snapshot(key))
-        if (packet.src.ip, packet.src.port) != (rec.remote.ip, rec.remote.port):
+        if (src.ip, src.port) != (rec.remote.ip, rec.remote.port):
             return TranslationResult(
                 False, None, DropReason.PEER_MISMATCH, rec.snapshot(key))
         self._check_expiry_overflow(now)
         rec.last_seen = now
         rec.expires_at = now + self._config.lifetime
-        rewritten = udp_five_tuple(packet.src, rec.internal)
+        rewritten = udp_five_tuple(src, rec.internal)
         return TranslationResult(True, rewritten, None, rec.snapshot(key))
 
     # ------------------------------------------------------------------ #

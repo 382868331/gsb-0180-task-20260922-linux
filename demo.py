@@ -99,6 +99,45 @@ def main() -> None:
     print(f"    当前包(gen={m1b.generation}) accepted={fresh.accepted}")
     assert not late.accepted and fresh.accepted
 
+    print("\n[2d] 内部回转：两台内网设备经对方公网映射互访")
+    hp = AddressDependentNAT(NATConfig(
+        public_ip=PUB, external_ports=(6100, 6101), lifetime=30, quarantine=5))
+    host_b = Endpoint("10.0.0.10", 40001)
+    ma = hp.allocate(HOST, Endpoint(PUB, 6101)).mapping    # HOST -> B 的公网映射
+    mb = hp.allocate(host_b, Endpoint(PUB, 6100)).mapping   # B -> HOST 的公网映射
+    print(f"    HOST 映射: 外端口 {ma.external_port} 对端 PUB:{mb.external_port}"
+          f" gen={ma.generation}")
+    print(f"    B    映射: 外端口 {mb.external_port} 对端 PUB:{ma.external_port}"
+          f" gen={mb.generation}")
+    hreq = hp.translate_outbound(
+        Packet(src=HOST, dst=Endpoint(PUB, mb.external_port),
+               generation=ma.generation))
+    print("    回转请求改写:")
+    show_five("五元组", hreq.rewritten)
+    assert (hreq.rewritten.src_ip, hreq.rewritten.src_port,
+            hreq.rewritten.dst_ip, hreq.rewritten.dst_port) == \
+           (PUB, ma.external_port, host_b.ip, host_b.port)
+    hrep = hp.translate_outbound(
+        Packet(src=host_b, dst=Endpoint(PUB, ma.external_port),
+               generation=mb.generation))
+    print("    回转返回改写:")
+    show_five("五元组", hrep.rewritten)
+    assert (hrep.rewritten.src_ip, hrep.rewritten.src_port,
+            hrep.rewritten.dst_ip, hrep.rewritten.dst_port) == \
+           (PUB, mb.external_port, HOST.ip, HOST.port)
+    # 过滤不被绕过：B 的映射释放、端口隔离后被对端 WEB_A 的新设备复用，
+    # HOST 的回转包对端不匹配，被 PEER_MISMATCH 拒绝，不会送给新设备。
+    hp.release(mb.key)
+    hp.advance(5)
+    stranger = Endpoint("10.0.0.11", 40002)
+    hp.allocate(stranger, WEB_A)                     # 复用 6101，对端是 WEB_A
+    blocked = hp.translate_outbound(
+        Packet(src=HOST, dst=Endpoint(PUB, mb.external_port),
+               generation=ma.generation))
+    print(f"    端口已重新分配给对端 WEB_A 的新设备：accepted={blocked.accepted}"
+          f" reason={blocked.reason.value}（不会送给新设备）")
+    assert not blocked.accepted and blocked.reason.value == "peer_mismatch"
+
     print("\n[3] 时钟推进与过期")
     expired = nat.advance(30)   # 所有映射 lifetime=30 到期
     print(f"    advance(30) 过期映射数: {len(expired)}, "

@@ -262,6 +262,112 @@ class TestInboundFiltering(unittest.TestCase):
         self.assertEqual(nat.stats()["live_mappings"], 1)
 
 
+class TestHairpin(unittest.TestCase):
+    """内部回转：内网设备经对方公网映射互访，请求与返回双向改写。"""
+
+    B = Endpoint("10.0.0.9", 41000)
+
+    def make_pair(self, quarantine=5):
+        """A、B 互相以对方公网映射地址为对端建立映射。"""
+        nat = make_nat(ports=(6001, 6002), lifetime=10, quarantine=quarantine)
+        # 先占位确定外端口：A 的映射 -> 6001，B 的映射 -> 6002。
+        m_a = nat.allocate(A, Endpoint(PUB, 6002)).mapping   # A -> B 的公网映射
+        m_b = nat.allocate(self.B, Endpoint(PUB, 6001)).mapping  # B -> A 的公网映射
+        self.assertEqual((m_a.external_port, m_b.external_port), (6001, 6002))
+        return nat, m_a, m_b
+
+    def test_hairpin_request_and_reply(self):
+        nat, m_a, m_b = self.make_pair()
+        # 请求：A -> B 的公网映射 (PUB:6002)。
+        req = nat.translate_outbound(
+            pkt(A, Endpoint(PUB, 6002), gen=m_a.generation))
+        self.assertTrue(req.accepted)
+        # 源改写为 A 的公网端点，目的直接落到 B 的内网端点。
+        self.assertEqual(
+            (req.rewritten.src_ip, req.rewritten.src_port,
+             req.rewritten.dst_ip, req.rewritten.dst_port),
+            (PUB, 6001, self.B.ip, self.B.port))
+        # 返回：B -> A 的公网映射 (PUB:6001)。
+        rep = nat.translate_outbound(
+            pkt(self.B, Endpoint(PUB, 6001), gen=m_b.generation))
+        self.assertTrue(rep.accepted)
+        self.assertEqual(
+            (rep.rewritten.src_ip, rep.rewritten.src_port,
+             rep.rewritten.dst_ip, rep.rewritten.dst_port),
+            (PUB, 6002, A.ip, A.port))
+
+    def test_hairpin_does_not_bypass_peer_filter(self):
+        # B 的映射对端是外部服务器，不是 A 的公网端点。
+        nat2 = make_nat(ports=(6001, 6002), lifetime=10)
+        nat2.allocate(A, Endpoint(PUB, 6002))                # A -> PUB:6002
+        nat2.allocate(self.B, R1)                            # B 的对端是 R1
+        req = nat2.translate_outbound(pkt(A, Endpoint(PUB, 6002)))
+        # 回转后源 (PUB,6001) != B 映射的对端 R1 -> 过滤生效，丢弃。
+        self.assertFalse(req.accepted)
+        self.assertIs(req.reason, DropReason.PEER_MISMATCH)
+
+    def test_hairpin_without_outbound_mapping_dropped(self):
+        nat, _, _ = self.make_pair()
+        stranger = Endpoint("10.0.0.10", 5000)
+        # 陌生内网端点没有到 PUB:6002 的出站映射 -> 不隐式建映射。
+        r = nat.translate_outbound(pkt(stranger, Endpoint(PUB, 6002)))
+        self.assertIs(r.reason, DropReason.NO_MAPPING)
+
+    def test_hairpin_target_expired_not_delivered(self):
+        nat, m_a, m_b = self.make_pair()
+        nat.advance(10)                      # 两条映射均过期，端口进隔离
+        r = nat.translate_outbound(pkt(A, Endpoint(PUB, 6002)))
+        self.assertIs(r.reason, DropReason.NO_MAPPING)
+        # 过期后端口被另一设备复用：旧回转包不能送给新设备。
+        nat.advance(5)                       # 隔离结束
+        c = Endpoint("10.0.0.11", 42000)
+        m_c = nat.allocate(c, R1).mapping    # 复用 6001
+        self.assertEqual(m_c.external_port, 6001)
+        m_d = nat.allocate(A, Endpoint(PUB, 6002)).mapping  # A 重新建映射 -> 6002
+        # A 的旧回转包（gen 是旧映射的）打向 6002，而 6002 现在属于 A->PUB:6002
+        # 自身；用迟到 generation 必拒。
+        late = nat.translate_outbound(pkt(A, Endpoint(PUB, 6002), gen=m_a.generation))
+        self.assertIs(late.reason, DropReason.STALE_GENERATION)
+
+    def test_hairpin_late_reply_rejected_after_rebind(self):
+        nat, m_a, m_b = self.make_pair()
+        # B 的映射释放并重建后 generation 递增；旧回复迟到必拒。
+        key_b = (self.B.ip, self.B.port, PUB, 6001)
+        nat.release(key_b)
+        nat.advance(5)                       # 隔离结束
+        m_b2 = nat.allocate(self.B, Endpoint(PUB, 6001)).mapping
+        self.assertGreater(m_b2.generation, m_b.generation)
+        late = nat.translate_outbound(
+            pkt(self.B, Endpoint(PUB, 6001), gen=m_b.generation))
+        self.assertIs(late.reason, DropReason.STALE_GENERATION)
+        fresh = nat.translate_outbound(
+            pkt(self.B, Endpoint(PUB, 6001), gen=m_b2.generation))
+        self.assertTrue(fresh.accepted)
+        self.assertEqual((fresh.rewritten.dst_ip, fresh.rewritten.dst_port),
+                         (A.ip, A.port))
+
+    def test_hairpin_resp_after_port_reassigned_to_new_device(self):
+        # 端口 6002 原属 B（对端 PUB:6001）；过期复用给新设备 D，
+        # D 的对端是外部服务器。旧回转包经对端过滤被拒，不送给 D。
+        nat = make_nat(ports=(6001, 6002, 6003), lifetime=10, quarantine=0)
+        nat.allocate(A, Endpoint(PUB, 6002))         # A: 6001
+        nat.allocate(self.B, Endpoint(PUB, 6001))    # B: 6002
+        nat.advance(10)                      # 两映射同时过期
+        d = Endpoint("10.0.0.12", 43000)
+        e = Endpoint("10.0.0.13", 44000)
+        nat.allocate(d, R1)                  # 6001 被 D 占（最小空闲）
+        nat.allocate(e, R1)                  # 6002 被 E 占（对端 R1）
+        r = nat.translate_outbound(pkt(A, Endpoint(PUB, 6002)))
+        # A 的出站映射已过期 -> 直接 NO_MAPPING，不会投递给 E。
+        self.assertIs(r.reason, DropReason.NO_MAPPING)
+        # A 重新建到 PUB:6002 的映射（拿 6003），源 (PUB,6003) != E 的对端 R1。
+        m_a2 = nat.allocate(A, Endpoint(PUB, 6002)).mapping
+        self.assertEqual(m_a2.external_port, 6003)
+        r2 = nat.translate_outbound(
+            pkt(A, Endpoint(PUB, 6002), gen=m_a2.generation))
+        self.assertIs(r2.reason, DropReason.PEER_MISMATCH)
+
+
 class TestRelease(unittest.TestCase):
     def test_release_semantics(self):
         nat = make_nat()

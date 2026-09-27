@@ -26,7 +26,8 @@ PUB = "203.0.113.9"
 PORTS = (7001, 7002, 7003, 7004)
 INTERNALS = [Endpoint("10.1.0.1", 5000), Endpoint("10.1.0.2", 5001)]
 REMOTES = [Endpoint("198.51.100.1", 53), Endpoint("198.51.100.2", 443),
-           Endpoint("203.0.113.200", 1234)]
+           Endpoint("203.0.113.200", 1234),
+           Endpoint(PUB, 7001), Endpoint(PUB, 7002)]  # 公网映射地址：触发内部回转
 KEYS = [(i.ip, i.port, r.ip, r.port) for i in INTERNALS for r in REMOTES]
 
 
